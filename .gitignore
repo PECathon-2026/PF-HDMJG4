@@ -1,0 +1,18 @@
+# Python virtual environment
+backend/.venv/
+backend/venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+backend/.env
+
+# Frontend dependencies
+node_modules/
+frontend/node_modules/
+frontend/dist/
