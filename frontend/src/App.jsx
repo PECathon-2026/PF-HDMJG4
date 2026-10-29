@@ -1,2113 +1,1355 @@
-import { useEffect, useState } from "react";
 
-import { openDB } from "idb";
-
+import { useEffect, useMemo, useState } from "react";
 import { XMLParser } from "fast-xml-parser";
-
 import { Readability } from "@mozilla/readability";
-
 import DOMPurify from "dompurify";
-
 import "./App.css";
 
-
-
 const API = "http://127.0.0.1:8000";
+const FEEDS_KEY = "openfolio-feeds";
+const ARTICLES_KEY = "openfolio-articles";
 
-const DB_NAME = "openfolio-db";
-
-const DB_VERSION = 1;
-
-
-
-const SEED_FEEDS = [
-
-  {
-
-    name: "Hacker News",
-
-    url: "https://hnrss.org/frontpage",
-
-    description: "Technology, programming and the independent web.",
-
-    color: "#f6c58b",
-
-  },
-
-  {
-
-    name: "CSS-Tricks",
-
-    url: "https://css-tricks.com/feed/",
-
-    description: "Web development and frontend design.",
-
-    color: "#c9d9f5",
-
-  },
-
-  {
-
-    name: "Smashing Magazine",
-
-    url: "https://www.smashingmagazine.com/feed/",
-
-    description: "Design, UX and web development.",
-
-    color: "#f4c8c8",
-
-  },
-
-  {
-
-    name: "A List Apart",
-
-    url: "https://alistapart.com/main/feed/",
-
-    description: "Thoughtful writing about web design and standards.",
-
-    color: "#cce7d0",
-
-  },
-
-  {
-
-    name: "The Pragmatic Engineer",
-
-    url: "https://newsletter.pragmaticengineer.com/feed",
-
-    description: "Software engineering and technology careers.",
-
-    color: "#e3d3f4",
-
-  },
-
+const SHARE_CATEGORIES = [
+  "Technology",
+  "Design",
+  "Writing",
+  "Science",
+  "Personal Blogs",
 ];
 
-
-
-const dbPromise = openDB(DB_NAME, DB_VERSION, {
-
-  upgrade(db) {
-
-    if (!db.objectStoreNames.contains("feeds")) {
-
-      db.createObjectStore("feeds", { keyPath: "url" });
-
-    }
-
-    if (!db.objectStoreNames.contains("articles")) {
-
-      db.createObjectStore("articles", { keyPath: "id" });
-
-    }
-
-  },
-
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text",
+  trimValues: true,
+  cdataPropName: "__cdata",
 });
 
-
-
-const parser = new XMLParser({
-
-  ignoreAttributes: false,
-
-  attributeNamePrefix: "@_",
-
-  textNodeName: "#text",
-
-  trimValues: true,
-
-  cdataPropName: "__cdata",
-
-});
-
-
-
-function textValue(value) {
-
-  if (value == null) return "";
-
-
-
-  if (typeof value === "string" || typeof value === "number") {
-
-    return String(value);
-
-  }
-
-
-
-  if (Array.isArray(value)) {
-
-    return textValue(value[0]);
-
-  }
-
-
-
-  if (typeof value === "object") {
-
-    return textValue(value.__cdata ?? value["#text"] ?? "");
-
-  }
-
-
-
-  return "";
-
-}
-
-
-
-function cleanExcerpt(value) {
-
-  return textValue(value)
-
-    .replace(/<[^>]*>/g, " ")
-
-    .replace(/&nbsp;/gi, " ")
-
-    .replace(/&amp;/gi, "&")
-
-    .replace(/&quot;/gi, '"')
-
-    .replace(/&#39;/gi, "'")
-
-    .replace(/&lt;/gi, "<")
-
-    .replace(/&gt;/gi, ">")
-
-    .replace(/\s+/g, " ")
-
-    .trim()
-
-    .slice(0, 500);
-
-}
-
-
-
-function getLink(link) {
-
-  if (typeof link === "string") return link;
-
-
-
-  if (Array.isArray(link)) {
-
-    const alternate = link.find(
-
-      (item) => item?.["@_rel"] === "alternate"
-
-    );
-
-    return getLink(alternate ?? link[0]);
-
-  }
-
-
-
-  if (link && typeof link === "object") {
-
-    return link["@_href"] || textValue(link);
-
-  }
-
-
-
-  return "";
-
-}
-
-
-
-function parseFeed(xml, feedName, feedUrl) {
-
-  const parsed = parser.parse(xml);
-
-  const channel = parsed?.rss?.channel;
-
-  const atomFeed = parsed?.feed;
-
-  const rawItems = channel ? channel.item : atomFeed?.entry;
-
-
-
-  const entries = rawItems
-
-    ? Array.isArray(rawItems)
-
-      ? rawItems
-
-      : [rawItems]
-
-    : [];
-
-
-
-  return entries
-
-    .map((entry) => {
-
-      const link = getLink(entry.link);
-
-      const title = textValue(entry.title) || "Untitled article";
-
-      const url = link || feedUrl;
-
-
-
-      const date = textValue(
-
-        entry.pubDate ??
-
-          entry.published ??
-
-          entry.updated ??
-
-          entry["dc:date"]
-
-      );
-
-
-
-      const excerpt = cleanExcerpt(
-
-        entry.description ??
-
-          entry.summary ??
-
-          entry.content ??
-
-          entry["content:encoded"]
-
-      );
-
-
-
-      return {
-
-        id: url,
-
-        title,
-
-        url,
-
-        feedName,
-
-        feedUrl,
-
-        date,
-
-        excerpt,
-
-        read: false,
-
-        fullHtml: "",
-
-        fullTitle: "",
-
-        byline: "",
-
-      };
-
-    })
-
-    .filter((article) => article.url);
-
-}
-
-
-
-function normalizeFeedUrl(value) {
-
-  const url = new URL(value.trim());
-
-
-
-  if (!["http:", "https:"].includes(url.protocol)) {
-
-    throw new Error("Please enter an HTTP or HTTPS URL.");
-
-  }
-
-
-
-  if (url.username || url.password) {
-
-    throw new Error("URLs containing login credentials aren't allowed.");
-
-  }
-
-
-
-  url.hash = "";
-
-  return url.href;
-
-}
-
-
-
-async function fetchRemote(url) {
-
-  const response = await fetch(
-
-    `${API}/api/fetch?url=${encodeURIComponent(url)}`
-
-  );
-
-
-
-  const result = await response.json().catch(() => ({}));
-
-
-
-  if (!response.ok) {
-
-    throw new Error(
-
-      result.detail || `Request failed (${response.status}).`
-
-    );
-
-  }
-
-
-
-  return result;
-
-}
-
-
-
-async function extractArticle(articleUrl) {
-
-  const result = await fetchRemote(articleUrl);
-
-
-
-  if (
-
-    !result.body ||
-
-    !result.content_type?.toLowerCase().includes("text/html")
-
-  ) {
-
-    throw new Error("This link did not return an HTML article.");
-
-  }
-
-
-
-  const documentCopy = new DOMParser().parseFromString(
-
-    result.body,
-
-    "text/html"
-
-  );
-
-
-
-  const parsedArticle = new Readability(documentCopy).parse();
-
-
-
-  if (!parsedArticle?.content) {
-
-    throw new Error("No readable article content could be extracted.");
-
-  }
-
-
-
-  return {
-
-    title: parsedArticle.title || "Article",
-
-    byline: parsedArticle.byline || "",
-
-    content: DOMPurify.sanitize(parsedArticle.content, {
-
-      USE_PROFILES: { html: true },
-
-    }),
-
-  };
-
-}
-
-
-
-function formatDate(date) {
-
-  if (!date) return "";
-
-
-
-  const parsed = new Date(date);
-
-
-
-  if (Number.isNaN(parsed.getTime())) return "";
-
-
-
-  return new Intl.DateTimeFormat("en", {
-
-    month: "short",
-
-    day: "numeric",
-
-    year: "numeric",
-
-  }).format(parsed);
-
-}
-
-
-
-function getHost(url) {
-
-  try {
-
-    return new URL(url).hostname.replace(/^www\./, "");
-
-  } catch {
-
-    return "";
-
-  }
-
-}
-
-
-
-export default function App() {
-
-  const [page, setPage] = useState("All articles");
-
-  const [feedList, setFeedList] = useState([]);
-
-  const [discoveryBlogs, setDiscoveryBlogs] = useState([]);
-
-const [recommendations, setRecommendations] = useState([]);
-
-  const [discoveryLoading, setDiscoveryLoading] = useState(false);
-
-  const [items, setItems] = useState([]);
-
-  const [selectedId, setSelectedId] = useState(null);
-
-  const [search, setSearch] = useState("");
-
-  const [feedUrl, setFeedUrl] = useState("");
-
-  const [message, setMessage] = useState("");
-
-  const [unreadOnly, setUnreadOnly] = useState(false);
-
-  const [storageReady, setStorageReady] = useState(false);
-
-  const [loadingFeed, setLoadingFeed] = useState(false);
-
-  const [readerLoading, setReaderLoading] = useState(false);
-
-  const [readerError, setReaderError] = useState("");
-
-  const [readerOpen, setReaderOpen] = useState(false);
-
-  const [refreshing, setRefreshing] = useState(false);
-
-
-
-  const selectedArticle =
-
-    items.find((article) => article.id === selectedId) ?? null;
-
-
-
-  // Load subscriptions and articles from IndexedDB.
-
-  useEffect(() => {
-
-    let cancelled = false;
-
-
-
-    async function loadSavedData() {
-
-      try {
-
-        const db = await dbPromise;
-
-        const [savedFeeds, savedArticles] = await Promise.all([
-
-          db.getAll("feeds"),
-
-          db.getAll("articles"),
-
-        ]);
-
-
-
-        if (cancelled) return;
-
-
-
-        setFeedList(savedFeeds);
-
-        setItems(savedArticles);
-
-      } catch (error) {
-
-        console.error("Could not load local data:", error);
-
-
-
-        if (!cancelled) {
-
-          setMessage("Could not load local data. Check the browser console.");
-
-        }
-
-      } finally {
-
-        if (!cancelled) setStorageReady(true);
-
-      }
-
-    }
-
-
-
-    loadSavedData();
-
-
-
-    return () => {
-
-      cancelled = true;
-
-    };
-
-  }, []);
-
-
-
-  // Persist subscriptions locally.
-
-  useEffect(() => {
-
-    if (!storageReady) return;
-
-
-
-    async function saveFeeds() {
-
-      try {
-
-        const db = await dbPromise;
-
-        const tx = db.transaction("feeds", "readwrite");
-
-
-
-        await tx.store.clear();
-
-
-
-        for (const feed of feedList) {
-
-          await tx.store.put(feed);
-
-        }
-
-
-
-        await tx.done;
-
-      } catch (error) {
-
-        console.error("Could not save feeds:", error);
-
-      }
-
-    }
-
-
-
-    saveFeeds();
-
-  }, [feedList, storageReady]);
-
-
-
-  // Persist articles, including extracted content, for offline reading.
-
-  useEffect(() => {
-
-    if (!storageReady) return;
-
-
-
-    async function saveArticles() {
-
-      try {
-
-        const db = await dbPromise;
-
-        const tx = db.transaction("articles", "readwrite");
-
-
-
-        await tx.store.clear();
-
-
-
-        for (const article of items) {
-
-          await tx.store.put(article);
-
-        }
-
-
-
-        await tx.done;
-
-      } catch (error) {
-
-        console.error("Could not save articles:", error);
-
-      }
-
-    }
-
-
-
-    saveArticles();
-
-  }, [items, storageReady]);
-
-
-
-async function loadDiscovery() {
-
-  setDiscoveryLoading(true);
-
-
-
-  try {
-
-    const response = await fetch(`${API}/api/discover`);
-
-
-
-    if (!response.ok) {
-
-      throw new Error("Could not load blog recommendations.");
-
-    }
-
-
-
-    const result = await response.json();
-
-    setDiscoveryBlogs(result.blogs || []);
-
-  } catch (error) {
-
-    console.error("Discovery error:", error);
-
-    setMessage(
-
-      "Could not load discovery blogs. Check that the backend is running."
-
-    );
-
-  } finally {
-
-    setDiscoveryLoading(false);
-
-  }
-
-}
-async function loadRecommendations(feedUrl) {
+function loadSavedData(key, fallback) {
   try {
-    const response = await fetch(
-      `${API}/api/discover/recommend?url=${encodeURIComponent(feedUrl)}`
-    );
-
-    if (!response.ok) {
-      throw new Error("Could not load recommendations.");
-    }
-
-    const result = await response.json();
-    setRecommendations(result.recommendations || []);
-  } catch (error) {
-    console.error("Recommendation error:", error);
-    setRecommendations([]);
+    const saved = localStorage.getItem(key);
+    return saved ? JSON.parse(saved) : fallback;
+  } catch {
+    return fallback;
   }
 }
 
-useEffect(() => {
-
-  if (page === "Discover") {
-
-    loadDiscovery();
-
-  }
-
-}, [page]);
-
-
-
-  async function addFeed(event) {
-
-    event.preventDefault();
-
-    setMessage("");
-
-
-
-    let normalizedUrl;
-
-
-
-    try {
-
-      normalizedUrl = normalizeFeedUrl(feedUrl);
-
-    } catch (error) {
-
-      setMessage(error.message || "Enter a valid feed URL.");
-
-      return;
-
-    }
-
-
-
-    if (feedList.some((feed) => feed.url === normalizedUrl)) {
-
-      setMessage("You're already subscribed to this feed.");
-
-      return;
-
-    }
-
-
-
-    if (feedList.length >= 50) {
-
-      setMessage("You've reached the 50-feed limit for this prototype.");
-
-      return;
-
-    }
-
-
-
-    setLoadingFeed(true);
-
-
-
-    try {
-
-      const result = await fetchRemote(normalizedUrl);
-
-
-
-      if (!result.body) {
-
-        throw new Error("The server returned an empty response.");
-
-      }
-
-
-
-      const feedName = getHost(normalizedUrl);
-
-      const parsedArticles = parseFeed(
-
-        result.body,
-
-        feedName,
-
-        normalizedUrl
-
-      );
-
-
-
-      if (parsedArticles.length === 0) {
-
-        throw new Error(
-
-          "No articles found. Enter a valid RSS or Atom feed URL."
-
-        );
-
-      }
-
-
-
-      setFeedList((current) => [
-
-        ...current,
-
-        { url: normalizedUrl, name: feedName },
-
-      ]);
-
-
-
-      setItems((current) => {
-
-        const existingIds = new Set(
-
-          current.map((article) => article.id)
-
-        );
-
-
-
-        const uniqueArticles = parsedArticles.filter(
-
-          (article) => !existingIds.has(article.id)
-
-        );
-
-
-
-        return [...uniqueArticles, ...current].slice(0, 1000);
-
-      });
-
-
-
-      setFeedUrl("");
-
-      setPage("All articles");
-
-      setSelectedId(null);
-
-      setReaderOpen(false);
-
-      setMessage(`Subscribed to ${feedName}.`);
-
-      // Update discovery popularity only after the feed was added locally.
-      const isDiscoveryBlog = discoveryBlogs.some(
-        (blog) => blog.url === normalizedUrl
-      );
-
-      if (isDiscoveryBlog) {
-        try {
-          const response = await fetch(`${API}/api/discover/subscribe`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: normalizedUrl }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`Discovery count request failed (${response.status}).`);
-          }
-
-          const result = await response.json();
-          setDiscoveryBlogs((currentBlogs) =>
-            currentBlogs.map((blog) =>
-              blog.url === result.blog.url ? result.blog : blog
-            )
-          );
-        } catch (error) {
-          console.error("Discovery count update failed:", error);
-        }
+function textValue(value) {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+
+  if (value && typeof value === "object") {
+    if ("__cdata" in value) return textValue(value.__cdata);
+    if ("#text" in value) return textValue(value["#text"]);
+  }
+
+  return "";
+}
+
+function cleanExcerpt(value) {
+  return textValue(value)
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeArticleUrl(value, feedUrl) {
+  try {
+    const url = new URL(value, feedUrl);
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password
+    ) return feedUrl;
+    url.hash = "";
+    return url.href;
+  } catch {
+    return feedUrl;
+  }
+}
+
+function parseFeed(xml, feedName, feedUrl) {
+  const parsed = xmlParser.parse(xml);
+  const root = parsed.rss?.channel || parsed.feed || parsed.RDF;
+
+  if (!root) {
+    throw new Error("This URL did not return a supported RSS or Atom feed.");
+  }
+
+  let entries = [];
+
+  if (root.item) {
+    entries = Array.isArray(root.item) ? root.item : [root.item];
+  } else if (root.entry) {
+    entries = Array.isArray(root.entry) ? root.entry : [root.entry];
+  }
+
+  if (!entries.length) {
+    throw new Error("No articles were found in this feed.");
+  }
+
+  return entries.map((entry, index) => {
+    const links = Array.isArray(entry.link)
+      ? entry.link
+      : entry.link
+        ? [entry.link]
+        : [];
+
+    let articleUrl = "";
+
+    for (const link of links) {
+      if (typeof link === "string") {
+        articleUrl = link;
+        break;
       }
 
-    } catch (error) {
-
-      setMessage(error.message || "Could not load this feed.");
-
-    } finally {
-
-      setLoadingFeed(false);
-
-    }
-
-  }
-
-
-
-  async function refreshFeeds() {
-
-    if (!feedList.length || refreshing) return;
-
-
-
-    setRefreshing(true);
-
-    setMessage("");
-
-
-
-    let addedCount = 0;
-
-    const collected = [];
-
-
-
-    try {
-
-      for (const feed of feedList) {
-
-        try {
-
-          const result = await fetchRemote(feed.url);
-
-          if (!result.body) continue;
-
-
-
-          const freshArticles = parseFeed(
-
-            result.body,
-
-            feed.name,
-
-            feed.url
-
-          );
-
-
-
-          collected.push(...freshArticles);
-
-        } catch (error) {
-
-          console.warn("Could not refresh:", feed.url, error);
-
-        }
-
-      }
-
-
-
-      setItems((current) => {
-
-        const existingIds = new Set(
-
-          current.map((article) => article.id)
-
-        );
-
-
-
-        const unique = collected.filter((article) => {
-
-          if (existingIds.has(article.id)) return false;
-
-          existingIds.add(article.id);
-
-          addedCount += 1;
-
-          return true;
-
-        });
-
-
-
-        return [...unique, ...current].slice(0, 1000);
-
-      });
-
-
-
-      setMessage(
-
-        addedCount
-
-          ? `Refresh complete. Found ${addedCount} new articles.`
-
-          : "Refresh complete. No new articles found."
-
-      );
-
-    } finally {
-
-      setRefreshing(false);
-
-    }
-
-  }
-
-
-
-  async function openArticle(article) {
-
-    setSelectedId(article.id);
-
-    setReaderOpen(true);
-
-    setReaderError("");
-
-    setPage("All articles");
-
-
-
-    // Mark as read immediately.
-
-    setItems((current) =>
-
-      current.map((item) =>
-
-        item.id === article.id ? { ...item, read: true } : item
-
-      )
-
-    );
-
-
-
-    // Previously extracted content can be opened offline.
-
-    if (article.fullHtml) return;
-
-
-
-    if (!navigator.onLine) {
-
-      setReaderError(
-
-        "This article hasn't been saved for offline reading yet."
-
-      );
-
-      return;
-
-    }
-
-
-
-    setReaderLoading(true);
-
-
-
-    try {
-
-      const extracted = await extractArticle(article.url);
-
-
-
-      setItems((current) =>
-
-        current.map((item) =>
-
-          item.id === article.id
-
-            ? {
-
-                ...item,
-
-                fullHtml: extracted.content,
-
-                fullTitle: extracted.title,
-
-                byline: extracted.byline,
-
-              }
-
-            : item
-
-        )
-
-      );
-
-    } catch (error) {
-
-      setReaderError(
-
-        error.message ||
-
-          "Could not extract the article. You can still open the original website."
-
-      );
-
-    } finally {
-
-      setReaderLoading(false);
-
-    }
-
-  }
-
-
-
-  function toggleRead(articleId) {
-
-    setItems((current) =>
-
-      current.map((article) =>
-
-        article.id === articleId
-
-          ? { ...article, read: !article.read }
-
-          : article
-
-      )
-
-    );
-
-  }
-
-
-
-  function removeFeed(url) {
-
-    const articleIds = items
-
-      .filter((article) => article.feedUrl === url)
-
-      .map((article) => article.id);
-
-
-
-    setFeedList((current) =>
-
-      current.filter((feed) => feed.url !== url)
-
-    );
-
-
-
-    setItems((current) =>
-
-      current.filter((article) => article.feedUrl !== url)
-
-    );
-
-
-
-    if (selectedArticle?.feedUrl === url) {
-
-      setSelectedId(null);
-
-      setReaderOpen(false);
-
-    }
-
-
-
-    setMessage("Subscription removed.");
-
-  }
-
-
-
-  function addSuggestedFeed(feed) {
-
-    setFeedUrl(feed.url);
-
-    setPage("Subscriptions");
-
-    setMessage("The feed URL is ready. Select Add feed to subscribe.");
-
-  }
-
-
-
-  const visibleArticles = items.filter((article) => {
-
-    const searchText = search.toLowerCase();
-
-
-
-    const matchesSearch = [
-
-      article.title,
-
-      article.feedName,
-
-      article.excerpt,
-
-    ]
-
-      .join(" ")
-
-      .toLowerCase()
-
-      .includes(searchText);
-
-
-
-    const matchesUnread = !unreadOnly || !article.read;
-
-
-
-    const matchesPage =
-
-      page === "All articles" ||
-
-      (page === "Unread" && !article.read) ||
-
-      page === "Subscriptions";
-
-
-
-    return matchesSearch && matchesUnread && matchesPage;
-
-  });
-
-
-
-  const unreadCount = items.filter((article) => !article.read).length;
-
-
-
-  return (
-
-    <div className="of-app">
-
-
-
-      <aside className="of-sidebar">
-
-        <div className="of-brand">
-
-          <div className="of-logo">o</div>
-
-          <div>
-
-            <div className="of-brand-name">openfolio</div>
-
-            <div className="of-tagline">A quieter corner of the web</div>
-
-          </div>
-
-        </div>
-
-
-
-        <div>
-
-          <div className="of-section-label">Your reading space</div>
-
-          <nav className="of-nav">
-
-            <button
-
-              className={page === "All articles" ? "active" : ""}
-
-              onClick={() => setPage("All articles")}
-
-            >
-
-              <span className="of-nav-icon">▤</span>
-
-              All articles
-
-            </button>
-
-
-
-            <button
-
-              className={page === "Unread" ? "active" : ""}
-
-              onClick={() => {
-
-                setPage("Unread");
-
-                setUnreadOnly(false);
-
-              }}
-
-            >
-
-              <span className="of-nav-icon">◉</span>
-
-              Unread
-
-              <span className="of-count">{unreadCount}</span>
-
-            </button>
-
-
-
-            <button
-
-              className={page === "Subscriptions" ? "active" : ""}
-
-              onClick={() => setPage("Subscriptions")}
-
-            >
-
-              <span className="of-nav-icon">▧</span>
-
-              Feeds
-
-              <span className="of-count">{feedList.length}</span>
-
-            </button>
-
-
-
-            <button
-
-              className={page === "Discover" ? "active" : ""}
-
-              onClick={() => setPage("Discover")}
-
-            >
-
-              <span className="of-nav-icon">✳</span>
-
-              Discover
-
-            </button>
-
-          </nav>
-
-        </div>
-
-
-
-        <div className="of-sidebar-bottom">
-
-          <div className="of-privacy">
-
-            <strong>♧ Your reading stays yours</strong>
-
-            Your subscriptions and saved articles live in this browser. Openfolio does not require an account.
-
-          </div>
-
-        </div>
-
-      </aside>
-
-
-
-      <main className="of-main">
-
-        <header className="of-topbar">
-
-          <div>
-
-            <div className="of-heading">
-
-              {page === "All articles"
-
-                ? "Your reading garden"
-
-                : page === "Unread"
-
-                  ? "Still to explore"
-
-                  : page === "Subscriptions"
-
-                    ? "Your publications"
-
-                    : "Find your next read"}
-
-            </div>
-
-            <div className="of-subheading">
-
-              {page === "Discover"
-
-                ? "Independent voices worth listening to."
-
-                : `${items.length} articles · ${feedList.length} publications`}
-
-            </div>
-
-          </div>
-
-
-
-          <input
-
-            className="of-search"
-
-            value={search}
-
-            onChange={(event) => setSearch(event.target.value)}
-
-            placeholder="⌕  Search articles and publications..."
-
-            aria-label="Search articles and publications"
-
-          />
-
-        </header>
-
-
-
-        <div className="of-content">
-
-          {message && (
-
-            <div className="of-message" role="status">
-
-              {message}
-
-              <button
-
-                className="of-text-button"
-
-                style={{ float: "right" }}
-
-                onClick={() => setMessage("")}
-
-              >
-
-                Dismiss
-
-              </button>
-
-            </div>
-
-          )}
-
-
-
-          {page === "Discover" && (
-
-            <>
-
-              <div className="of-toolbar">
-
-                <div>
-
-                  <strong>Handpicked starting points</strong>
-
-                  <div className="of-muted" style={{ marginTop: 5 }}>
-
-                    Explore a few publications, then add their feeds.
-
-                  </div>
-
-                </div>
-
-              </div>
-
-
-
-              <div className="of-cards">
-
-                {discoveryBlogs.filter((feed) =>
-
-                  `${feed.name} ${feed.category || ""} ${feed.url}`
-
-                    .toLowerCase()
-
-                    .includes(search.toLowerCase())
-
-                ).map((feed) => {
-
-                  const subscribed = feedList.some(
-
-                    (item) => item.url === feed.url
-
-                  );
-
-
-
-                  return (
-
-                    <article className="of-card" key={feed.url}>
-
-                      <div
-
-                        className="of-card-color"
-
-                        style={{ background: feed.color }}
-
-                      >
-
-                        ✳
-
-                      </div>
-
-                      <h3>{feed.name}</h3>
-                      <p>{feed.category}</p>
-                      <small>{feed.subscriber_count} readers subscribed</small>
-                      <small>{feed.url}</small>
-
-                      <button
-
-                        className="of-button"
-
-                        disabled={subscribed || loadingFeed}
-
-                        onClick={() => addSuggestedFeed(feed)}
-
-                      >
-
-                        {subscribed ? "Already subscribed" : "Add publication"}
-
-                      </button>
-
-                    </article>
-
-                  );
-
-                })}
-
-              </div>
-
-
-
-              <div className="of-footer">
-
-                Suggestions are a starter directory, not a popularity ranking.
-
-              </div>
-
-            </>
-
-          )}
-
-
-
-          {page === "Subscriptions" && (
-
-            <>
-
-              <section className="of-list-panel" style={{ marginBottom: 22 }}>
-
-                <div className="of-panel-heading">
-
-                  <span>Add a publication</span>
-
-                  <span className="of-muted">RSS / Atom</span>
-
-                </div>
-
-
-
-                <div style={{ padding: 20 }}>
-
-                  <form className="of-feed-form" onSubmit={addFeed}>
-
-                    <input
-
-                      className="of-input"
-
-                      type="url"
-
-                      value={feedUrl}
-
-                      onChange={(event) => setFeedUrl(event.target.value)}
-
-                      placeholder="https://example.com/feed.xml"
-
-                      required
-
-                    />
-
-                    <button
-
-                      className="of-button"
-
-                      disabled={loadingFeed}
-
-                      type="submit"
-
-                    >
-
-                      {loadingFeed ? "Adding..." : "Add feed"}
-
-                    </button>
-
-                  </form>
-
-                  <div className="of-muted" style={{ marginTop: 10 }}>
-
-                    Paste an RSS or Atom feed URL. A website homepage may not be a feed.
-
-                  </div>
-
-                </div>
-
-              </section>
-
-
-
-              <section className="of-list-panel">
-
-                <div className="of-panel-heading">
-
-                  <span>Your subscriptions</span>
-
-                  <span className="of-muted">{feedList.length} feeds</span>
-
-                </div>
-
-
-
-                {feedList.length === 0 ? (
-
-                  <div className="of-empty">
-
-                    <div className="of-empty-icon">♧</div>
-
-                    No publications yet. Add a feed above or visit Discover.
-
-                  </div>
-
-                ) : (
-
-                  feedList.map((feed) => (
-
-                    <div className="of-subscription" key={feed.url}>
-
-                      <div>
-
-                        <strong>{feed.name}</strong>
-
-                        <small>{feed.url}</small>
-
-                      </div>
-
-                      <button
-
-                        className="of-text-button"
-
-                        onClick={() => removeFeed(feed.url)}
-
-                      >
-
-                        Remove
-
-                      </button>
-
-                    </div>
-
-                  ))
-
-                )}
-
-              </section>
-
-            </>
-
-          )}
-
-
-
-          {(page === "All articles" || page === "Unread") && (
-
-            <>
-
-              <div className="of-toolbar">
-
-                <button
-
-                  className="of-button of-button-light"
-
-                  onClick={refreshFeeds}
-
-                  disabled={refreshing || feedList.length === 0}
-
-                >
-
-                  {refreshing ? "Refreshing..." : "↻ Refresh feeds"}
-
-                </button>
-
-
-
-                <label className="of-checkbox">
-
-                  <input
-
-                    type="checkbox"
-
-                    checked={unreadOnly}
-
-                    onChange={(event) => setUnreadOnly(event.target.checked)}
-
-                  />
-
-                  Show unread only
-
-                </label>
-
-
-
-                <span className="of-muted" style={{ marginLeft: "auto" }}>
-
-                  {visibleArticles.length} shown
-
-                </span>
-
-              </div>
-
-
-
-              <div className="of-article-layout">
-
-                <section className="of-list-panel">
-
-                  <div className="of-panel-heading">
-
-                    <span>Latest stories</span>
-
-                    <span className="of-muted">{visibleArticles.length}</span>
-
-                  </div>
-
-
-
-                  {visibleArticles.length === 0 ? (
-
-                    <div className="of-empty">
-
-                      <div className="of-empty-icon">✳</div>
-
-                      {items.length === 0
-
-                        ? "Your reading garden is waiting. Add a feed to get started."
-
-                        : "No matching articles. Try another search or filter."}
-
-                    </div>
-
-                  ) : (
-
-                    visibleArticles.map((article) => (
-
-                      <article
-
-                        className={`of-article-row ${
-                          selectedId === article.id ? "selected" : ""
-                        }`}
-
-                        key={article.id}
-
-                        onClick={() => openArticle(article)}
-
-                      >
-
-                        <div className="of-row-meta">
-
-                          {!article.read && <span className="of-dot" />}
-
-                          <span>{article.feedName}</span>
-
-                          {formatDate(article.date) && (
-
-                            <>
-
-                              <span>·</span>
-
-                              <span>{formatDate(article.date)}</span>
-
-                            </>
-
-                          )}
-
-                        </div>
-
-
-
-                        <div className="of-article-title">
-
-                          {article.title}
-
-                        </div>
-
-
-
-                        <div className="of-excerpt">
-
-                          {article.excerpt || "Open this story to read more."}
-
-                        </div>
-
-
-
-                        <div className="of-row-actions">
-
-                          <button
-
-                            className="of-text-button"
-
-                            onClick={(event) => {
-
-                              event.stopPropagation();
-
-                              toggleRead(article.id);
-
-                            }}
-
-                          >
-
-                            {article.read
-
-                              ? "Mark unread"
-
-                              : "Mark as read"}
-
-                          </button>
-
-
-
-                          {article.fullHtml && (
-
-                            <span className="of-muted">· Saved offline</span>
-
-                          )}
-
-                        </div>
-
-                      </article>
-
-                    ))
-
-                  )}
-
-                </section>
-
-
-
-                <section className="of-reader">
-
-                  {!readerOpen || !selectedArticle ? (
-
-                    <div className="of-empty" style={{ paddingTop: 100 }}>
-
-                      <div className="of-empty-icon">📖</div>
-
-                      <strong style={{ color: "#657568" }}>
-
-                        A little space to read
-
-                      </strong>
-
-                      <p>Select a story to open its reading view.</p>
-
-                      <p className="of-muted">
-
-                        Previously extracted articles are saved in this browser.
-
-                      </p>
-
-                    </div>
-
-                  ) : (
-
-                    <>
-
-                      <div className="of-reader-top">
-
-                        <button
-
-                          className="of-text-button"
-
-                          onClick={() => setReaderOpen(false)}
-
-                        >
-
-                          ← Close reader
-
-                        </button>
-
-
-
-                        <a
-
-                          className="of-text-button"
-
-                          href={selectedArticle.url}
-
-                          target="_blank"
-
-                          rel="noopener noreferrer"
-
-                        >
-
-                          Original ↗
-
-                        </a>
-
-                      </div>
-
-
-
-                      <div className="of-reader-content">
-
-                        <div className="of-row-meta">
-
-                          <span>{selectedArticle.feedName}</span>
-
-                          {formatDate(selectedArticle.date) && (
-
-                            <>
-
-                              <span>·</span>
-
-                              <span>{formatDate(selectedArticle.date)}</span>
-
-                            </>
-
-                          )}
-
-                        </div>
-
-
-
-                        <h1>
-
-                          {selectedArticle.fullTitle ||
-
-                            selectedArticle.title}
-
-                        </h1>
-
-
-
-                        {selectedArticle.byline && (
-
-                          <div className="of-byline">
-
-                            By {selectedArticle.byline}
-
-                          </div>
-
-                        )}
-
-
-
-                        {readerLoading && (
-
-                          <div className="of-empty">
-
-                            <div className="of-empty-icon">✳</div>
-
-                            Extracting the article for comfortable reading...
-
-                          </div>
-
-                        )}
-
-
-
-                        {readerError && !readerLoading && (
-
-                          <div className="of-reader-error">
-
-                            {readerError}
-
-                            <div style={{ marginTop: 10 }}>
-
-                              <a
-
-                                href={selectedArticle.url}
-
-                                target="_blank"
-
-                                rel="noopener noreferrer"
-
-                              >
-
-                                Read on the original website ↗
-
-                              </a>
-
-                            </div>
-
-                          </div>
-
-                        )}
-
-
-
-                        {!readerLoading && selectedArticle.fullHtml && (
-
-                          <div
-
-                            className="of-prose"
-
-                            dangerouslySetInnerHTML={{
-
-                              __html: selectedArticle.fullHtml,
-
-                            }}
-
-                          />
-
-                        )}
-
-
-
-                        {!readerLoading &&
-
-                          !selectedArticle.fullHtml &&
-
-                          !readerError && (
-
-                            <div className="of-prose">
-
-                              <p>
-
-                                {selectedArticle.excerpt ||
-
-                                  "No summary is available for this article."}
-
-                              </p>
-
-                            </div>
-
-                          )}
-
-
-
-                        <div style={{ marginTop: 30 }}>
-
-                          <a
-
-                            className="of-text-button"
-
-                            href={selectedArticle.url}
-
-                            target="_blank"
-
-                            rel="noopener noreferrer"
-
-                          >
-
-                            Visit original publication ↗
-
-                          </a>
-
-                        </div>
-
-                      </div>
-
-                    </>
-
-                  )}
-
-                </section>
-
-              </div>
-
-            </>
-
-          )}
-
-        </div>
-
-      </main>
-
-    </div>
-
-  );
-
+      if (
+        link &&
+        typeof link === "object" &&
+        (link["@_rel"] === "alternate" || !link["@_rel"])
+      ) {
+        articleUrl = link["@_href"] || textValue(link["#text"]);
+        if (articleUrl) break;
+      }
+    }
+
+    articleUrl ||= textValue(entry.guid || entry.id) || feedUrl;
+    articleUrl = normalizeArticleUrl(articleUrl, feedUrl);
+
+    const title = cleanExcerpt(entry.title) || "Untitled article";
+
+    const rawDate = textValue(
+      entry.pubDate ||
+        entry.published ||
+        entry.updated ||
+        entry["dc:date"]
+    );
+
+    const timestamp = rawDate ? Date.parse(rawDate) || 0 : 0;
+
+    const rawDescription =
+      entry["content:encoded"] ??
+      entry.description ??
+      entry.summary ??
+      entry.content ??
+      "";
+
+    const excerpt =
+      cleanExcerpt(rawDescription).slice(0, 350) ||
+      "Open the article to read more.";
+
+    return {
+      id: `${feedUrl}|${articleUrl}`,
+      category: "ARTICLE",
+      title,
+      blog: feedName,
+      date: timestamp
+        ? new Date(timestamp).toLocaleDateString()
+        : "Date unavailable",
+      timestamp,
+      read: false,
+      color: ["peach", "blue", "green", "lavender"][index % 4],
+      excerpt,
+      url: articleUrl,
+      feedUrl,
+    };
+  });
 }
+
+// Fetching stays on the existing backend proxy; parsing and discovery happen in the browser.
+async function fetchFeedDocument(url) {
+  const response = await fetch(
+    `${API}/api/fetch?url=${encodeURIComponent(url)}`
+  );
+
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error("The backend returned an invalid response.");
+  }
+
+  if (!response.ok) {
+    throw new Error(result.detail || `Feed request failed (${response.status}).`);
+  }
+
+  if (typeof result.body !== "string") {
+    throw new Error("The backend response did not contain page content.");
+  }
+
+  return result;
+}
+
+function findAlternateFeedLinks(html, pageUrl) {
+  const document = new DOMParser().parseFromString(html, "text/html");
+  const links = Array.from(document.querySelectorAll("link[rel][href]"));
+
+  return links
+    .filter((link) => {
+      const rel = (link.getAttribute("rel") || "")
+        .toLowerCase()
+        .split(/\s+/);
+      const type = (link.getAttribute("type") || "").toLowerCase();
+      return (
+        rel.includes("alternate") &&
+        (type.includes("rss") ||
+          type.includes("atom") ||
+          type.includes("rdf") ||
+          type.includes("xml"))
+      );
+    })
+    .map((link) => {
+      try {
+        const candidate = new URL(link.getAttribute("href"), pageUrl);
+        return ["http:", "https:"].includes(candidate.protocol)
+          ? candidate.href
+          : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function discoverAndParseFeed(pageUrl, initialDocument) {
+  const attempted = new Set([pageUrl]);
+  const candidates = [
+    ...findAlternateFeedLinks(initialDocument.body, pageUrl),
+  ];
+
+  // Common feed endpoints used by blogs and publishing platforms.
+  const origin = new URL(pageUrl).origin;
+  for (const path of ["/feed", "/feed/", "/rss.xml", "/feed.xml", "/atom.xml", "/index.xml"]) {
+    candidates.push(new URL(path, origin).href);
+  }
+
+  let lastError = new Error("No RSS or Atom feed was found at this address.");
+  for (const candidate of candidates) {
+    if (attempted.has(candidate)) continue;
+    attempted.add(candidate);
+
+    try {
+      const document = await fetchFeedDocument(candidate);
+      const name = new URL(candidate).hostname.replace(/^www\./i, "");
+      const articles = parseFeed(document.body, name, candidate);
+      return { feedUrl: candidate, name, articles };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(
+    `Could not find a feed automatically. Try pasting the direct RSS/Atom URL. ${lastError.message}`
+  );
+}
+
+const STARTER_RECOMMENDATIONS = [
+  {
+    name: "Hacker News",
+    category: "Technology",
+    tags: ["Technology", "Community"],
+    description:
+      "Interesting links and conversations from the tech community.",
+    url: "https://hnrss.org/frontpage",
+  },
+  {
+    name: "The Marginalian",
+    category: "Writing",
+    tags: ["Writing", "Science", "Culture"],
+    description:
+      "Essays exploring creativity, meaning, science, and art.",
+    url: "https://www.themarginalian.org/feed/",
+  },
+  {
+    name: "Smashing Magazine",
+    category: "Design",
+    tags: ["Design", "Technology"],
+    description:
+      "Practical ideas for people who design and build for the web.",
+    url: "https://www.smashingmagazine.com/feed/",
+  },
+  {
+    name: "NASA",
+    category: "Science",
+    tags: ["Science"],
+    description:
+      "News and discoveries about space, missions, and astronomy.",
+    url: "https://www.nasa.gov/feed/",
+  },
+  {
+    name: "Simon Willison",
+    category: "Personal Blogs",
+    tags: ["Personal Blogs", "Technology"],
+    description:
+      "Notes and experiments on programming, data, and technology.",
+    url: "https://simonwillison.net/atom/everything/",
+  },
+];
+
+const DISCOVER_CATEGORIES = [
+  "All",
+  ...SHARE_CATEGORIES,
+];
+
+function App() {
+  const [page, setPage] = useState("All articles");
+
+  const [feedList, setFeedList] = useState(() =>
+    loadSavedData(FEEDS_KEY, [])
+  );
+
+  const [items, setItems] = useState(() =>
+    loadSavedData(ARTICLES_KEY, [])
+  );
+
+  const [selected, setSelected] = useState(null);
+  const [search, setSearch] = useState("");
+  const [feedUrl, setFeedUrl] = useState("");
+  const [message, setMessage] = useState("");
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const [sharing, setSharing] = useState(false);
+  const [discoverSearch, setDiscoverSearch] = useState("");
+  const [discoverCategory, setDiscoverCategory] = useState("All");
+
+  const [communityRecommendations, setCommunityRecommendations] =
+    useState([]);
+  const [communityLoading, setCommunityLoading] = useState(false);
+  const [communityError, setCommunityError] = useState("");
+  const [submittingUrl, setSubmittingUrl] = useState("");
+
+  // State for choosing a category before recommending a subscription.
+  const [recommendCategoryForUrl, setRecommendCategoryForUrl] =
+    useState("");
+  const [recommendCategory, setRecommendCategory] =
+    useState("Personal Blogs");
+
+  const [articleText, setArticleText] = useState("");
+  const [articleHtml, setArticleHtml] = useState("");
+  const [articleTitle, setArticleTitle] = useState("");
+  const [articleBusy, setArticleBusy] = useState(false);
+  const [articleError, setArticleError] = useState("");
+
+  // Save personal subscriptions in the browser.
+  useEffect(() => {
+    try {
+      localStorage.setItem(FEEDS_KEY, JSON.stringify(feedList));
+    } catch {
+      setMessage("Could not save subscriptions in this browser.");
+    }
+  }, [feedList]);
+
+  // Save personal articles and their cached text in the browser.
+  useEffect(() => {
+    try {
+      localStorage.setItem(ARTICLES_KEY, JSON.stringify(items));
+    } catch {
+      setMessage("Could not save articles. Browser storage may be full.");
+    }
+  }, [items]);
+
+  // Load community recommendations when Discover is opened.
+  useEffect(() => {
+    if (page !== "Discover") return;
+
+    let cancelled = false;
+
+    async function loadCommunityRecommendations() {
+      setCommunityLoading(true);
+      setCommunityError("");
+
+      try {
+        const response = await fetch(`${API}/api/discover`);
+
+        if (!response.ok) {
+          throw new Error("Could not load community recommendations.");
+        }
+
+        const result = await response.json();
+
+        if (!cancelled) {
+          setCommunityRecommendations(
+            Array.isArray(result.recommendations)
+              ? result.recommendations
+              : []
+          );
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setCommunityError(
+            error.message || "Could not connect to the Openfolio backend."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setCommunityLoading(false);
+        }
+      }
+    }
+
+    loadCommunityRecommendations();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [page]);
+
+  // Extract full article content in the browser. The API only returns raw HTML.
+  useEffect(() => {
+    if (!selected) {
+      setArticleText("");
+      setArticleHtml("");
+      setArticleTitle("");
+      setArticleError("");
+      setArticleBusy(false);
+      return;
+    }
+
+    let cancelled = false;
+    const sanitizeOptions = {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form", "input", "button"],
+      FORBID_ATTR: ["style", "srcdoc"],
+    };
+    const cachedHtml = selected.fullHtml
+      ? DOMPurify.sanitize(selected.fullHtml, sanitizeOptions)
+      : "";
+    const cachedText = selected.fullText || "";
+
+    setArticleHtml(cachedHtml);
+    setArticleText(cachedText);
+    setArticleTitle(selected.fullTitle || selected.title);
+    setArticleError("");
+
+    if (cachedHtml || cachedText) {
+      setArticleBusy(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    async function loadArticle() {
+      setArticleBusy(true);
+      try {
+        const result = await fetchFeedDocument(selected.url);
+        if (!result.content_type.toLowerCase().includes("html")) {
+          throw new Error("This link did not return an HTML article.");
+        }
+
+        const parsedDocument = new DOMParser().parseFromString(
+          result.body,
+          "text/html"
+        );
+        const readable = new Readability(parsedDocument.cloneNode(true)).parse();
+        if (!readable || !readable.content) {
+          throw new Error("Could not extract readable article content.");
+        }
+
+        // Sanitize before rendering and before saving to local browser storage.
+        const safeHtml = DOMPurify.sanitize(readable.content, sanitizeOptions);
+        const textDocument = new DOMParser().parseFromString(safeHtml, "text/html");
+        const safeText = (textDocument.body.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!safeText) {
+          throw new Error("The article did not contain readable text.");
+        }
+        if (cancelled) return;
+
+        setArticleHtml(safeHtml);
+        setArticleText(safeText);
+        setArticleTitle(readable.title || selected.title);
+        setItems((current) =>
+          current.map((item) =>
+            item.id === selected.id
+              ? {
+                  ...item,
+                  fullHtml: safeHtml,
+                  fullText: safeText,
+                  fullTitle: readable.title || selected.title,
+                }
+              : item
+          )
+        );
+      } catch (error) {
+        if (!cancelled) {
+          setArticleError(
+            error.message || "Could not load this article. Showing the feed summary instead."
+          );
+          // Keep articleText empty so the feed excerpt is shown as a fallback.
+        }
+      } finally {
+        if (!cancelled) setArticleBusy(false);
+      }
+    }
+
+    loadArticle();
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.id]);
+
+  // Filter and sort the user's own article library.
+  const visibleItems = useMemo(() => {
+    return items
+      .filter((article) => {
+        const matchesSearch =
+          `${article.title} ${article.blog} ${article.category}`
+            .toLowerCase()
+            .includes(search.toLowerCase());
+
+        const matchesUnread = !unreadOnly || !article.read;
+        const matchesPage = page !== "Unread" || !article.read;
+
+        const isFeedPage = feedList.some((feed) => feed.name === page);
+        const matchesFeed = !isFeedPage || article.blog === page;
+
+        return (
+          matchesSearch &&
+          matchesUnread &&
+          matchesPage &&
+          matchesFeed
+        );
+      })
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }, [items, search, unreadOnly, page, feedList]);
+
+  // Subscribe with either a direct feed URL or a blog homepage URL.
+  async function addFeed(event) {
+    event.preventDefault();
+    if (busy) return;
+
+    let url = feedUrl.trim();
+    let parsedUrl;
+
+    try {
+      parsedUrl = new URL(url);
+      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+        throw new Error("Only HTTP and HTTPS URLs are supported.");
+      }
+      if (parsedUrl.username || parsedUrl.password) {
+        throw new Error("URLs containing usernames or passwords are not supported.");
+      }
+    } catch {
+      setMessage("Enter a valid public HTTP or HTTPS website or feed URL.");
+      return;
+    }
+
+    if (feedList.some((feed) => feed.url === url)) {
+      setMessage("You have already subscribed to this feed.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("Checking for an RSS or Atom feed…");
+
+    try {
+      const initialDocument = await fetchFeedDocument(url);
+      let resolved;
+
+      try {
+        const name = parsedUrl.hostname.replace(/^www\./i, "");
+        const articles = parseFeed(initialDocument.body, name, url);
+        resolved = { feedUrl: url, name, articles };
+      } catch {
+        setMessage("That looks like a website. Discovering its feed…");
+        resolved = await discoverAndParseFeed(url, initialDocument);
+      }
+
+      if (feedList.some((feed) => feed.url === resolved.feedUrl)) {
+        setMessage("You have already subscribed to this feed.");
+        return;
+      }
+
+      const { feedUrl: resolvedFeedUrl, name, articles: newArticles } = resolved;
+      setFeedList((current) => [
+        ...current,
+        { name, url: resolvedFeedUrl, count: newArticles.length },
+      ]);
+
+      setItems((current) => {
+        const existingIds = new Set(current.map((item) => item.id));
+        const uniqueArticles = newArticles.filter(
+          (item) => !existingIds.has(item.id)
+        );
+        return [...current, ...uniqueArticles].sort(
+          (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
+        );
+      });
+
+      setPage(name);
+      setSelected(null);
+      setFeedUrl("");
+      setMessage(
+        `Successfully loaded ${newArticles.length} articles from ${name}.`
+      );
+    } catch (error) {
+      setMessage(error.message || "Unable to find or load this feed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Remove a subscription and its cached articles from this browser.
+  function removeSubscription(feed) {
+    const confirmed = window.confirm(
+      `Remove \"${feed.name}\" from your subscriptions? Its cached articles will also be removed.`
+    );
+    if (!confirmed) return;
+
+    setFeedList((current) => current.filter((savedFeed) => savedFeed.url !== feed.url));
+    setItems((current) =>
+      current.filter((article) =>
+        article.feedUrl ? article.feedUrl !== feed.url : article.blog !== feed.name
+      )
+    );
+
+    if (page === feed.name || selected?.feedUrl === feed.url) {
+      setPage("All articles");
+      setSelected(null);
+    }
+    if (recommendCategoryForUrl === feed.url) {
+      setRecommendCategoryForUrl("");
+    }
+    setMessage(`Removed ${feed.name} from your subscriptions.`);
+  }
+
+  // Submit a feed to the community with its chosen category.
+  async function recommendToCommunity(feed) {
+    if (submittingUrl) return;
+
+    setSubmittingUrl(feed.url);
+    setCommunityError("");
+
+    try {
+      const response = await fetch(`${API}/api/discover`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: feed.name,
+          url: feed.url,
+          category: feed.category || feed.tags?.[0] || "Writing",
+          description: feed.description,
+        }),
+      });
+
+      let result;
+
+      try {
+        result = await response.json();
+      } catch {
+        throw new Error("The server returned an invalid response.");
+      }
+
+      if (!response.ok) {
+        if (response.status === 409) {
+          throw new Error(
+            "This feed has already been recommended to the community."
+          );
+        }
+
+        throw new Error(
+          result.detail || "Could not submit this recommendation."
+        );
+      }
+
+      // Refresh the directory after the recommendation is saved.
+      const refreshResponse = await fetch(`${API}/api/discover`);
+
+      if (!refreshResponse.ok) {
+        throw new Error(
+          "Your recommendation was submitted, but the directory could not refresh."
+        );
+      }
+
+      const refreshed = await refreshResponse.json();
+
+      setCommunityRecommendations(
+        Array.isArray(refreshed.recommendations)
+          ? refreshed.recommendations
+          : []
+      );
+
+      setRecommendCategoryForUrl("");
+      setMessage(
+        `${feed.name} was recommended to the community under ${feed.category || feed.tags?.[0] || "Writing"}.`
+      );
+    } catch (error) {
+      setCommunityError(
+        error.message || "Could not connect to the Openfolio backend."
+      );
+    } finally {
+      setSubmittingUrl("");
+    }
+  }
+
+  function markRead(article) {
+    const updated = { ...article, read: true };
+
+    setItems((current) =>
+      current.map((item) =>
+        item.id === article.id ? { ...item, read: true } : item
+      )
+    );
+
+    setSelected(updated);
+  }
+
+  function toggleRead(article) {
+    setItems((current) =>
+      current.map((item) =>
+        item.id === article.id
+          ? { ...item, read: !item.read }
+          : item
+      )
+    );
+
+    if (selected?.id === article.id) {
+      setSelected({ ...article, read: !article.read });
+    }
+  }
+
+  // Combine built-in suggestions with recommendations from the database.
+  const allRecommendations = [
+    ...STARTER_RECOMMENDATIONS.map((feed) => ({
+      ...feed,
+      source: "starter",
+    })),
+    ...communityRecommendations.map((feed) => ({
+      ...feed,
+      tags: [feed.category || "Writing"],
+      source: "community",
+    })),
+  ];
+
+  // Show only one entry for each URL.
+  const uniqueRecommendations = Array.from(
+    new Map(allRecommendations.map((feed) => [feed.url, feed])).values()
+  );
+
+  const filteredRecommendations = uniqueRecommendations.filter((feed) => {
+    const query = discoverSearch.trim().toLowerCase();
+
+    const matchesSearch =
+      `${feed.name} ${feed.description || ""} ${(feed.tags || []).join(" ")}`
+        .toLowerCase()
+        .includes(query);
+
+    const matchesCategory =
+      discoverCategory === "All" ||
+      (feed.tags || []).includes(discoverCategory);
+
+    return matchesSearch && matchesCategory;
+  });
+
+  return (
+    <div className="app">
+      <aside className="sidebar">
+        <button
+          className="brand"
+          onClick={() => {
+            setPage("All articles");
+            setSelected(null);
+            setMessage("");
+          }}
+        >
+          <span className="brand-icon">o.</span>
+          <span>
+            <strong>openfolio</strong>
+            <small>THE OPEN WEB, YOUR WAY</small>
+          </span>
+        </button>
+
+        <button
+          className="add-feed"
+          onClick={() => {
+            setPage("Add a feed");
+            setSelected(null);
+            setMessage("");
+          }}
+        >
+          ＋ Add a feed
+        </button>
+
+        <div className="nav-label">LIBRARY</div>
+
+        {[
+          ["All articles", "▤"],
+          ["Unread", "◉"],
+          ["Discover", "✳"],
+        ].map(([label, icon]) => (
+          <button
+            key={label}
+            className={`nav-link ${page === label ? "active" : ""}`}
+            onClick={() => {
+              setPage(label);
+              setSelected(null);
+              setMessage("");
+            }}
+          >
+            <span>{icon}</span>
+            {label}
+            {label === "Unread" && (
+              <small>{items.filter((item) => !item.read).length}</small>
+            )}
+          </button>
+        ))}
+
+        <div className="nav-label feeds-label">
+          YOUR SUBSCRIPTIONS <span>{feedList.length}</span>
+        </div>
+
+        {feedList.map((feed) => {
+          const alreadyRecommended = communityRecommendations.some(
+            (savedFeed) => savedFeed.url === feed.url
+          );
+
+          const categoryFormOpen = recommendCategoryForUrl === feed.url;
+
+          return (
+            <div className="subscription-item" key={feed.url}>
+              <button
+                className={`feed-link ${page === feed.name ? "active" : ""}`}
+                onClick={() => {
+                  setPage(feed.name);
+                  setSelected(null);
+                  setMessage("");
+                }}
+              >
+                <span className="feed-dot" />
+                {feed.name}
+              </button>
+
+              {categoryFormOpen ? (
+                <div className="recommend-category-form">
+                  <label>
+                    Share category
+                    <select
+                      value={recommendCategory}
+                      onChange={(event) =>
+                        setRecommendCategory(event.target.value)
+                      }
+                      disabled={Boolean(submittingUrl)}
+                    >
+                      {SHARE_CATEGORIES.map((category) => (
+                        <option key={category} value={category}>
+                          {category}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <button
+                    type="button"
+                    className="recommend-feed-button"
+                    disabled={Boolean(submittingUrl)}
+                    onClick={() =>
+                      recommendToCommunity({
+                        name: feed.name,
+                        url: feed.url,
+                        category: recommendCategory,
+                        description: `A feed recommended by an Openfolio reader: ${feed.name}.`,
+                      })
+                    }
+                  >
+                    {submittingUrl === feed.url
+                      ? "Sharing…"
+                      : "Submit recommendation"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="recommend-cancel-button"
+                    disabled={Boolean(submittingUrl)}
+                    onClick={() => setRecommendCategoryForUrl("")}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="recommend-feed-button"
+                  disabled={Boolean(submittingUrl) || alreadyRecommended}
+                  title={
+                    alreadyRecommended
+                      ? "Already recommended"
+                      : "Recommend this feed to the community"
+                  }
+                  onClick={() => {
+                    setRecommendCategory("Personal Blogs");
+                    setRecommendCategoryForUrl(feed.url);
+                  }}
+                >
+                  {alreadyRecommended ? "Recommended ✓" : "Recommend ↗"}
+                </button>
+              )}
+
+              <button
+                type="button"
+                className="remove-subscription-button"
+                onClick={() => removeSubscription(feed)}
+                title={`Remove ${feed.name} from your subscriptions`}
+              >
+                Remove subscription
+              </button>
+            </div>
+          );
+        })}
+
+        <div className="sidebar-bottom">
+          <div className="privacy-icon">◇</div>
+          <strong>Your reading is yours.</strong>
+          <p>No accounts. No tracking. Just the web you choose.</p>
+          <span>PRIVACY BY DESIGN</span>
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div className="breadcrumb">
+            YOUR LIBRARY <span>/</span>{" "}
+            {selected ? "READING" : page.toUpperCase()}
+          </div>
+
+          <div className="top-actions">
+            <label className="search-box">
+              <span>⌕</span>
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search your library..."
+              />
+            </label>
+            <div className="avatar">O</div>
+          </div>
+        </header>
+
+        {message && (
+          <div className="message-bar" role="status">
+            {message}
+            <button onClick={() => setMessage("")}>×</button>
+          </div>
+        )}
+
+        {communityError && (
+          <div className="message-bar" role="alert">
+            {communityError}
+            <button type="button" onClick={() => setCommunityError("")}>
+              ×
+            </button>
+          </div>
+        )}
+
+        {selected ? (
+          <section className="reader-view">
+            <button
+              className="back-link"
+              onClick={() => setSelected(null)}
+            >
+              ← Back to library
+            </button>
+
+            <div className={`article-art art-${selected.color || "peach"}`}>
+              <span>{selected.category}</span>
+              <div className="art-shape">✳</div>
+            </div>
+
+            <span className="category">{selected.category}</span>
+            <h1>{articleTitle || selected.title}</h1>
+
+            <div className="article-meta">
+              {selected.blog} · {selected.date}
+            </div>
+
+            <div className="article-body">
+              {articleBusy ? (
+                <p>Fetching the full article…</p>
+              ) : (
+                <>
+                  {articleError && (
+                    <p className="reader-fallback-note" role="status">
+                      Full text unavailable: {articleError} Showing the feed summary if no cached article is available.
+                    </p>
+                  )}
+                  {articleHtml ? (
+                    <div
+                      className="full-article-content"
+                      dangerouslySetInnerHTML={{
+                        __html: DOMPurify.sanitize(articleHtml, {
+                          USE_PROFILES: { html: true },
+                          FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form", "input", "button"],
+                          FORBID_ATTR: ["style", "srcdoc"],
+                        }),
+                      }}
+                    />
+                  ) : (
+                    <p className="full-article-text">
+                      {articleText || selected.excerpt}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="reader-actions">
+              <a
+                className="primary-button"
+                href={selected.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Read original article ↗
+              </a>
+
+              <button
+                className="back-link"
+                onClick={() => toggleRead(selected)}
+              >
+                {selected.read ? "Mark as unread" : "Mark as read"}
+              </button>
+            </div>
+          </section>
+        ) : page === "Add a feed" ? (
+          <section className="page-content">
+            <div className="page-heading">
+              <span className="eyebrow">GROW YOUR LIBRARY</span>
+              <h1>Follow something good.</h1>
+              <p>
+                Paste a blog homepage or a direct RSS/Atom feed URL. Openfolio will try to find the feed automatically.
+              </p>
+            </div>
+
+            <form className="add-feed-form" onSubmit={addFeed}>
+              <label htmlFor="feed-url">WEBSITE OR FEED URL</label>
+              <input
+                id="feed-url"
+                type="url"
+                value={feedUrl}
+                onChange={(event) => setFeedUrl(event.target.value)}
+                placeholder="https://example.com or https://hnrss.org/frontpage"
+                required
+              />
+
+              <button className="primary-button" disabled={busy}>
+                {busy ? "Loading feed…" : "Add subscription →"}
+              </button>
+            </form>
+
+            <div className="note-card">
+              <span>✳</span>
+              <div>
+                <strong>Automatic feed discovery</strong>
+                <p>Paste a blog homepage or a direct feed URL. We check RSS/Atom discovery links and common feed paths.</p>
+              </div>
+            </div>
+          </section>
+        ) : page === "Discover" ? (
+          <section className="page-content">
+            <div className="page-heading">
+              <span className="eyebrow">THE WIDER WEB</span>
+              <h1>Find your next favorite.</h1>
+              <p>
+                Independent voices, personal blogs, and thoughtful writing
+                from across the open web.
+              </p>
+            </div>
+
+            <div className="privacy-card">
+              <div className="privacy-icon large">◇</div>
+              <div>
+                <h3>Discovery without tracking</h3>
+                <p>
+                  Explore these suggestions without creating an account.
+                  Your personal subscriptions stay in your browser.
+                  Community recommendations are submitted only when you
+                  choose to share them.
+                </p>
+
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={sharing}
+                    onChange={(event) => setSharing(event.target.checked)}
+                  />
+                  <span>Opt in to anonymous sharing</span>
+                </label>
+
+                <small>
+                  {sharing
+                    ? "This toggle is a local demo setting. It does not automatically submit anything."
+                    : "Sharing is off. No recommendation is submitted automatically."}
+                </small>
+              </div>
+            </div>
+
+            <h2 className="subheading">Explore the open web</h2>
+
+            {communityLoading && (
+              <p role="status">Loading community recommendations…</p>
+            )}
+
+            <label className="discover-search">
+              <span>⌕</span>
+              <input
+                type="search"
+                value={discoverSearch}
+                onChange={(event) => setDiscoverSearch(event.target.value)}
+                placeholder="Search blogs, topics, and ideas..."
+                aria-label="Search Discover recommendations"
+              />
+
+              {discoverSearch && (
+                <button
+                  type="button"
+                  onClick={() => setDiscoverSearch("")}
+                  aria-label="Clear search"
+                >
+                  ×
+                </button>
+              )}
+            </label>
+
+            <div
+              className="discover-categories"
+              aria-label="Filter by category"
+            >
+              {DISCOVER_CATEGORIES.map((category) => (
+                <button
+                  type="button"
+                  key={category}
+                  className={discoverCategory === category ? "active" : ""}
+                  onClick={() => setDiscoverCategory(category)}
+                >
+                  {category}
+                </button>
+              ))}
+            </div>
+
+            <p className="discover-result-count">
+              {filteredRecommendations.length}{" "}
+              {filteredRecommendations.length === 1
+                ? "recommendation"
+                : "recommendations"}
+            </p>
+
+            {filteredRecommendations.map((feed, index) => {
+              const alreadyAdded = feedList.some(
+                (savedFeed) => savedFeed.url === feed.url
+              );
+
+              const alreadyRecommended = communityRecommendations.some(
+                (savedFeed) => savedFeed.url === feed.url
+              );
+
+              return (
+                <div className="discover-row" key={feed.url}>
+                  <div className={`discover-avatar color-${index % 3}`}>
+                    {feed.name.charAt(0)}
+                  </div>
+
+                  <div className="discover-info">
+                    <strong>{feed.name}</strong>
+                    <p>{(feed.tags || []).join(" · ")}</p>
+                    <p>{feed.description}</p>
+
+                    {feed.source === "community" && (
+                      <small>Community recommendation</small>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={alreadyAdded}
+                    onClick={() => {
+                      setFeedUrl(feed.url);
+                      setPage("Add a feed");
+                      setSelected(null);
+                      setMessage(
+                        `Feed URL filled in for ${feed.name}. Click Add subscription to try it.`
+                      );
+                    }}
+                  >
+                    {alreadyAdded ? "Added ✓" : "Try feed →"}
+                  </button>
+
+                  {feed.source === "starter" && (
+                    <button
+                      type="button"
+                      disabled={
+                        Boolean(submittingUrl) || alreadyRecommended
+                      }
+                      onClick={() => recommendToCommunity(feed)}
+                    >
+                      {submittingUrl === feed.url
+                        ? "Sharing…"
+                        : alreadyRecommended
+                          ? "Recommended ✓"
+                          : "Recommend to community"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+
+            {!filteredRecommendations.length && !communityLoading && (
+              <div className="empty-state">
+                <span>◇</span>
+                <h3>No matches yet.</h3>
+                <p>
+                  Try another search or choose a different category.
+                </p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => {
+                    setDiscoverSearch("");
+                    setDiscoverCategory("All");
+                  }}
+                >
+                  Clear filters
+                </button>
+              </div>
+            )}
+
+            <p className="demo-label">
+              STARTER SUGGESTIONS · COMMUNITY SUBMISSIONS STORED BY THE BACKEND
+            </p>
+          </section>
+        ) : (
+          <section className="page-content">
+            <div className="welcome-row">
+              <div>
+                <span className="eyebrow">A LITTLE SPACE TO THINK</span>
+                <h1>Your corner of the internet.</h1>
+                <p>
+                  A quieter way to keep up with the things you care about.
+                </p>
+              </div>
+              <div className="welcome-symbol">✳</div>
+            </div>
+
+            <div className="stats-row">
+              <div>
+                <span>IN YOUR LIBRARY</span>
+                <strong>{items.length}</strong>
+                <small>Saved articles</small>
+              </div>
+              <div>
+                <span>SUBSCRIPTIONS</span>
+                <strong>{feedList.length}</strong>
+                <small>Saved feeds</small>
+              </div>
+              <div>
+                <span>UNREAD</span>
+                <strong>{items.filter((item) => !item.read).length}</strong>
+                <small>Waiting for you</small>
+              </div>
+            </div>
+
+            <div className="section-title">
+              <div>
+                <h2>
+                  {page === "Unread"
+                    ? "Worth your attention"
+                    : page === "All articles"
+                      ? "Latest stories"
+                      : page}
+                </h2>
+                <p>Independent voices, in chronological order.</p>
+              </div>
+
+              <label className="unread-toggle">
+                <input
+                  type="checkbox"
+                  checked={unreadOnly}
+                  onChange={(event) => setUnreadOnly(event.target.checked)}
+                />
+                Unread only
+              </label>
+            </div>
+
+            <div className="article-list">
+              {visibleItems.map((article) => (
+                <article className="story-card" key={article.id}>
+                  <button
+                    className={`article-art art-${article.color}`}
+                    onClick={() => markRead(article)}
+                    aria-label={`Read ${article.title}`}
+                  >
+                    <span>{article.category}</span>
+                    <div className="art-shape">✳</div>
+                  </button>
+
+                  <button
+                    className="story-content"
+                    onClick={() => markRead(article)}
+                  >
+                    <span className="category">{article.category}</span>
+                    <h3>{article.title}</h3>
+                    <p>{article.excerpt}</p>
+
+                    <div className="story-meta">
+                      <strong>{article.blog}</strong>
+                      <span> · {article.date}</span>
+                      {article.read && (
+                        <span className="read-tag">READ</span>
+                      )}
+                    </div>
+                  </button>
+
+                  <button
+                    className="more-button"
+                    title={article.read ? "Mark unread" : "Mark read"}
+                    onClick={() => toggleRead(article)}
+                  >
+                    {article.read ? "○" : "↗"}
+                  </button>
+                </article>
+              ))}
+
+              {!visibleItems.length && (
+                <div className="empty-state">
+                  <span>◇</span>
+                  <h3>Nothing here just yet.</h3>
+                  <p>
+                    Add an RSS or Atom feed to fill your library with
+                    articles.
+                  </p>
+                  <button
+                    className="primary-button"
+                    onClick={() => {
+                      setPage("Add a feed");
+                      setSelected(null);
+                    }}
+                  >
+                    Add a feed
+                  </button>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        <footer className="footer">
+          <span>OPENFOLIO © 2026</span>
+          <span>MADE FOR READERS, NOT ALGORITHMS.</span>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+export default App;

@@ -1,25 +1,326 @@
-import sqlite3
-from pathlib import Path
-from pydantic import BaseModel
-from urllib.parse import urlparse
-import ipaddress
-import socket
+"""Openfolio API: safe, bounded raw-page proxy and anonymous discovery storage.
+
+Article/feed parsing and article extraction are deliberately performed in the browser.
+"""
+
 import asyncio
-import httpx
-from fastapi import FastAPI, HTTPException, Query
+import hashlib
+import hmac
+import ipaddress
+import os
+import secrets
+import socket
+import sqlite3
+import time
+from collections import defaultdict, deque
+from contextlib import closing
+from urllib.parse import urlsplit, urlunsplit
+
+import aiohttp
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Openfolio API")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.getenv("OPENFOLIO_DATABASE", os.path.join(BASE_DIR, "openfolio.db"))
+MAX_RESPONSE_BYTES = 2_000_000
+RATE_LIMIT_SALT = os.getenv("OPENFOLIO_RATE_LIMIT_SALT") or secrets.token_hex(32)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
     ],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
+
+# In-memory limiter: raw IPs are never written to disk or retained in the map.
+# The map stores only a keyed digest and expires entries after their window.
+_rate_buckets = defaultdict(deque)
+_last_rate_cleanup = 0.0
+_RATE_POLICIES = {
+    "fetch": (40, 60),       # 40 page fetches per minute per client
+    "discover_post": (8, 3600),  # 8 submissions per hour per client
+    "discover_get": (120, 60),   # 120 directory reads per minute per client
+}
+
+
+def _client_digest(request: Request) -> str:
+    raw_ip = request.client.host if request.client else "unknown"
+    return hmac.new(
+        RATE_LIMIT_SALT.encode("utf-8"),
+        raw_ip.encode("utf-8", errors="replace"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def enforce_rate_limit(request: Request, action: str) -> None:
+    global _last_rate_cleanup
+    limit, window = _RATE_POLICIES[action]
+    now = time.monotonic()
+    key = (action, _client_digest(request))
+    bucket = _rate_buckets[key]
+    while bucket and now - bucket[0] >= window:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit reached. Please wait a little before trying again.",
+            headers={"Retry-After": str(max(1, int(window - (now - bucket[0]))))},
+        )
+    bucket.append(now)
+
+    # Expire keyed client digests regularly; no raw IP is retained or persisted.
+    if now - _last_rate_cleanup > 60 or len(_rate_buckets) > 10_000:
+        _last_rate_cleanup = now
+        for old_key, old_bucket in list(_rate_buckets.items()):
+            old_action = old_key[0]
+            old_window = _RATE_POLICIES[old_action][1]
+            while old_bucket and now - old_bucket[0] >= old_window:
+                old_bucket.popleft()
+            if not old_bucket:
+                _rate_buckets.pop(old_key, None)
+
+
+def normalize_public_url(url: str, *, resolve_dns: bool = True) -> str:
+    """Validate and canonicalize an HTTP(S) URL; reject local/private destinations."""
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        raise HTTPException(400, "Enter a valid URL (maximum 2048 characters).")
+    if any(ord(ch) < 32 for ch in url) or "\\" in url:
+        raise HTTPException(400, "URL contains invalid characters.")
+
+    try:
+        parsed = urlsplit(url.strip())
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "Enter a valid HTTP or HTTPS URL.")
+        if parsed.username is not None or parsed.password is not None:
+            raise HTTPException(400, "URL credentials are not allowed.")
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(400, "Invalid URL or port.")
+
+    host = parsed.hostname.rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".test", ".invalid")):
+        raise HTTPException(400, "Local or reserved hostnames are not allowed.")
+
+    # Convert internationalized names to a stable ASCII form.
+    try:
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if not ip_obj.is_global:
+                raise HTTPException(400, "Private or non-public IP addresses are not allowed.")
+            host_ascii = ip_obj.compressed
+        except ValueError:
+            host_ascii = host.encode("idna").decode("ascii")
+            if not host_ascii or len(host_ascii) > 253:
+                raise HTTPException(400, "Invalid hostname.")
+            labels = host_ascii.split(".")
+            if any(not label or len(label) > 63 for label in labels):
+                raise HTTPException(400, "Invalid hostname.")
+            if resolve_dns:
+                try:
+                    infos = socket.getaddrinfo(
+                        host_ascii,
+                        port or (443 if scheme == "https" else 80),
+                        type=socket.SOCK_STREAM,
+                    )
+                except socket.gaierror:
+                    raise HTTPException(400, "Could not resolve hostname.")
+                addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
+                if not addresses or any(not address.is_global for address in addresses):
+                    raise HTTPException(400, "Host resolves to a private or non-public address.")
+    except UnicodeError:
+        raise HTTPException(400, "Invalid internationalized hostname.")
+
+    # Rebuild netloc without credentials, normalize host and omit default ports.
+    if ":" in host_ascii and not host_ascii.startswith("["):
+        netloc_host = f"[{host_ascii}]"
+    else:
+        netloc_host = host_ascii
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{netloc_host}:{port}"
+    else:
+        netloc = netloc_host
+
+    path = parsed.path or "/"
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+class PublicOnlyResolver(aiohttp.abc.AbstractResolver):
+    """Resolve DNS at connection time and pin the socket to public IP results.
+
+    This prevents a hostname from passing an earlier check and then resolving to
+    a private address when the HTTP connection is made (DNS rebinding/TOCTOU).
+    """
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        loop = asyncio.get_running_loop()
+        try:
+            ip = ipaddress.ip_address(host.strip("[]"))
+            addresses = [(ip.version == 4 and socket.AF_INET or socket.AF_INET6, ip.compressed)]
+        except ValueError:
+            try:
+                # Inspect both A and AAAA records even if the connector asks
+                # for one family; a mixed public/private answer must fail closed.
+                infos = await loop.getaddrinfo(
+                    host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+                )
+            except socket.gaierror as exc:
+                raise OSError("Could not resolve hostname") from exc
+            addresses = [(info[0], info[4][0]) for info in infos]
+
+        unique = []
+        seen = set()
+        for address_family, address_text in addresses:
+            address = ipaddress.ip_address(address_text.split("%", 1)[0])
+            if not address.is_global:
+                raise OSError("Host resolves to a private or non-public address")
+            key = (address_family, address.compressed)
+            if key not in seen:
+                seen.add(key)
+                unique.append({
+                    "hostname": host,
+                    "host": address.compressed,
+                    "port": port,
+                    "family": address_family,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                })
+        if not unique:
+            raise OSError("No public address was found")
+        return unique
+
+    async def close(self):
+        return None
+
+
+def init_database():
+    with closing(sqlite3.connect(DATABASE)) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.commit()
+
+
+@app.on_event("startup")
+def startup():
+    init_database()
+
+
+class RecommendationInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=8, max_length=2048)
+    category: str = Field(min_length=1, max_length=40)
+    description: str = Field(min_length=1, max_length=300)
+
+    class Config:
+        extra = "forbid"
+
+
+async def download_page(url: str):
+    # Check URL syntax and literal IPs here. DNS is validated asynchronously
+    # by PublicOnlyResolver at connection time, which also pins the socket IP.
+    normalized = normalize_public_url(url, resolve_dns=False)
+    timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_read=8)
+    connector = aiohttp.TCPConnector(
+        resolver=PublicOnlyResolver(),
+        use_dns_cache=False,
+        limit=10,
+        ssl=True,
+    )
+    headers = {"User-Agent": "OpenfolioReader/1.0 (+RSS reader)"}
+
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            trust_env=False,
+            headers=headers,
+            auto_decompress=True,
+        ) as session:
+            async with session.get(
+                normalized,
+                allow_redirects=False,
+                max_line_size=8190,
+                max_field_size=8190,
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise HTTPException(
+                        502,
+                        "This website redirected the request. Try its final URL.",
+                    )
+                if response.status >= 400:
+                    raise HTTPException(
+                        502, f"Website returned HTTP {response.status}."
+                    )
+
+                content_type = response.headers.get("Content-Type", "").lower()
+                supported = (
+                    "html" in content_type
+                    or "xml" in content_type
+                    or "rss" in content_type
+                    or "atom" in content_type
+                    or "text/plain" in content_type
+                )
+                if content_type and not supported:
+                    raise HTTPException(
+                        415,
+                        "Unsupported content type. Use a webpage or RSS/Atom feed.",
+                    )
+
+                declared_length = response.headers.get("Content-Length")
+                if declared_length:
+                    try:
+                        if int(declared_length) > MAX_RESPONSE_BYTES:
+                            raise HTTPException(413, "Response exceeds the 2 MB limit.")
+                    except ValueError:
+                        pass
+
+                chunks = []
+                total = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > MAX_RESPONSE_BYTES:
+                        raise HTTPException(413, "Response exceeds the 2 MB limit.")
+                    chunks.append(chunk)
+
+                charset = response.charset or "utf-8"
+                body_bytes = b"".join(chunks)
+                try:
+                    body = body_bytes.decode(charset, errors="replace")
+                except LookupError:
+                    body = body_bytes.decode("utf-8", errors="replace")
+
+                return {
+                    "url": normalized,
+                    "status_code": response.status,
+                    "content_type": content_type,
+                    "body": body,
+                }
+    except HTTPException:
+        raise
+    except (aiohttp.ServerTimeoutError, TimeoutError):
+        raise HTTPException(504, "Website request timed out.")
+    except (aiohttp.ClientError, OSError, ValueError) as exc:
+        message = str(exc).lower()
+        if "private" in message or "non-public" in message:
+            raise HTTPException(400, "Host resolves to a private or non-public address.")
+        raise HTTPException(502, "Could not safely fetch this website.")
 
 
 @app.get("/api/health")
@@ -27,357 +328,66 @@ def health():
     return {"status": "ok", "service": "Openfolio API"}
 
 
-def validate_public_url(url: str):
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise HTTPException(400, "Enter a valid HTTP or HTTPS URL.")
-
-    if parsed.username or parsed.password:
-        raise HTTPException(400, "URL credentials are not allowed.")
-
-    host = parsed.hostname.lower()
-
-    if host == "localhost" or host.endswith((".localhost", ".local")):
-        raise HTTPException(400, "Local network URLs are not allowed.")
-
-    try:
-        addresses = socket.getaddrinfo(
-            host, None, type=socket.SOCK_STREAM
-        )
-    except socket.gaierror:
-        raise HTTPException(400, "Could not resolve hostname.")
-
-    if not addresses:
-        raise HTTPException(400, "Could not resolve hostname.")
-
-    for address in addresses:
-        if not ipaddress.ip_address(address[4][0]).is_global:
-            raise HTTPException(400, "Private network addresses are not allowed.")
-
-    return url
-
-
 @app.get("/api/fetch")
-
-@app.get("/api/fetch")
-async def fetch_url(url: str = Query(..., max_length=2048)):
-    import ipaddress
-    import socket
-    from urllib.parse import urljoin, urlparse
-
-    MAX_BYTES = 2_000_000
-    MAX_REDIRECTS = 5
-
-    async def validate_destination(target: str) -> str:
-        parsed = urlparse(target)
-
-        if parsed.scheme not in ("http", "https"):
-            raise HTTPException(400, "Only HTTP and HTTPS URLs are allowed.")
-
-        if not parsed.hostname or parsed.username or parsed.password:
-            raise HTTPException(400, "Invalid website URL.")
-
-        host = parsed.hostname
-
-        try:
-            ip = ipaddress.ip_address(host)
-            addresses = [ip]
-        except ValueError:
-            try:
-                records = await asyncio.to_thread(
-                    socket.getaddrinfo, host, parsed.port or (
-                        443 if parsed.scheme == "https" else 80
-                    ), type=socket.SOCK_STREAM
-                )
-                addresses = list({
-                    ipaddress.ip_address(record[4][0])
-                    for record in records
-                })
-            except OSError:
-                raise HTTPException(400, "Could not resolve website address.")
-
-        if not addresses or any(
-            not address.is_global for address in addresses
-        ):
-            raise HTTPException(400, "Private or local addresses are not allowed.")
-
-        return target
-
-    current_url = url
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=12,
-            follow_redirects=False,
-            headers={"User-Agent": "OpenfolioReader/0.1"},
-            trust_env=False,
-        ) as client:
-            for redirect_number in range(MAX_REDIRECTS + 1):
-                await validate_destination(current_url)
-
-                async with client.stream("GET", current_url) as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get("location")
-
-                        if not location:
-                            raise HTTPException(502, "Redirect has no destination.")
-
-                        if redirect_number >= MAX_REDIRECTS:
-                            raise HTTPException(502, "Too many redirects.")
-
-                        current_url = urljoin(current_url, location)
-                        continue
-
-                    if response.status_code >= 400:
-                        raise HTTPException(
-                            502, f"Website returned HTTP {response.status_code}."
-                        )
-
-                    content = bytearray()
-
-                    async for chunk in response.aiter_bytes():
-                        content.extend(chunk)
-
-                        if len(content) > MAX_BYTES:
-                            raise HTTPException(
-                                413, "Response exceeds the 2 MB limit."
-                            )
-
-                    return {
-                        "url": current_url,
-                        "status_code": response.status_code,
-                        "content_type": response.headers.get("content-type", ""),
-                        "body": bytes(content).decode("utf-8", errors="replace"),
-                    }
-
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Website request timed out.")
-    except httpx.RequestError:
-        raise HTTPException(502, "Could not fetch website.")
-
-    raise HTTPException(502, "Could not complete website request.")
+async def fetch_url(
+    request: Request,
+    url: str = Query(..., max_length=2048),
+):
+    enforce_rate_limit(request, "fetch")
+    # Raw text only: the backend does not parse feeds, extract article text, or cache content.
+    return await download_page(url)
 
 
-# --- Anonymous blog discovery ---
+@app.get("/api/article")
+async def removed_article_endpoint():
+    raise HTTPException(
+        410,
+        "Article extraction now happens in the browser. Fetch the raw HTML using /api/fetch.",
+    )
 
-DISCOVERY_DB = Path(__file__).with_name("discovery.db")
-
-SEED_BLOGS = [
-    {
-        "url": "https://hnrss.org/frontpage",
-        "name": "Hacker News",
-        "category": "Technology",
-        "count": 18,
-    },
-    {
-        "url": "https://css-tricks.com/feed/",
-        "name": "CSS-Tricks",
-        "category": "Web Development",
-        "count": 14,
-    },
-    {
-        "url": "https://www.smashingmagazine.com/feed/",
-        "name": "Smashing Magazine",
-        "category": "Design",
-        "count": 12,
-    },
-    {
-        "url": "https://alistapart.com/main/feed/",
-        "name": "A List Apart",
-        "category": "Design",
-        "count": 9,
-    },
-    {
-        "url": "https://newsletter.pragmaticengineer.com/feed",
-        "name": "The Pragmatic Engineer",
-        "category": "Engineering",
-        "count": 11,
-    },
-]
-
-
-def get_discovery_connection():
-    connection = sqlite3.connect(DISCOVERY_DB)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def initialize_discovery_db():
-    with get_discovery_connection() as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS discovery_blogs (
-                url TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                subscriber_count INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS discovery_pairs (
-                url_a TEXT NOT NULL,
-                url_b TEXT NOT NULL,
-                pair_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (url_a, url_b),
-                CHECK (url_a < url_b)
-            )
-        """)
-
-        for blog in SEED_BLOGS:
-            connection.execute("""
-                INSERT OR IGNORE INTO discovery_blogs
-                    (url, name, category, subscriber_count)
-                VALUES (?, ?, ?, ?)
-            """, (
-                blog["url"],
-                blog["name"],
-                blog["category"],
-                blog["count"],
-            ))
-
-
-initialize_discovery_db()
-
-
-class DiscoverySubscription(BaseModel):
-    url: str
-class DiscoveryBatch(BaseModel):
-    urls: list[str]
-    share: bool = False
 
 @app.get("/api/discover")
-def discover_blogs():
-    with get_discovery_connection() as connection:
-        rows = connection.execute("""
-            SELECT url, name, category, subscriber_count
-            FROM discovery_blogs
-            ORDER BY subscriber_count DESC, name ASC
+def get_recommendations(request: Request):
+    enforce_rate_limit(request, "discover_get")
+    with closing(sqlite3.connect(DATABASE)) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("""
+            SELECT id, name, url, category, description, created_at
+            FROM recommendations
+            ORDER BY created_at DESC, id DESC
+            LIMIT 200
         """).fetchall()
+    return {"recommendations": [dict(row) for row in rows]}
+
+
+@app.post("/api/discover", status_code=201)
+def submit_recommendation(request: Request, recommendation: RecommendationInput):
+    enforce_rate_limit(request, "discover_post")
+    name = recommendation.name.strip()
+    category = recommendation.category.strip()
+    description = recommendation.description.strip()
+    if not name or not category or not description:
+        raise HTTPException(400, "All fields must contain text.")
+
+    url = normalize_public_url(recommendation.url.strip(), resolve_dns=True)
+    try:
+        with closing(sqlite3.connect(DATABASE, timeout=5)) as db:
+            cursor = db.execute("""
+                INSERT INTO recommendations (name, url, category, description)
+                VALUES (?, ?, ?, ?)
+            """, (name, url, category, description))
+            db.commit()
+            new_id = cursor.lastrowid
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "This feed has already been recommended.")
+    except sqlite3.Error:
+        raise HTTPException(500, "Could not save recommendation.")
 
     return {
-        "blogs": [dict(row) for row in rows]
+        "id": new_id,
+        "name": name,
+        "url": url,
+        "category": category,
+        "description": description,
+        "message": "Recommendation submitted.",
     }
-
-
-@app.post("/api/discover/subscribe")
-def count_discovery_subscription(payload: DiscoverySubscription):
-    try:
-        url = validate_public_url(payload.url)
-    except HTTPException:
-        raise
-
-    with get_discovery_connection() as connection:
-        existing = connection.execute(
-            "SELECT url FROM discovery_blogs WHERE url = ?",
-            (url,),
-        ).fetchone()
-
-        if not existing:
-            raise HTTPException(
-                status_code=404,
-                detail="Blog not found in discovery."
-            )
-
-        connection.execute("""
-            UPDATE discovery_blogs
-            SET subscriber_count = subscriber_count + 1
-            WHERE url = ?
-        """, (url,))
-
-        row = connection.execute("""
-            SELECT url, name, category, subscriber_count
-            FROM discovery_blogs
-            WHERE url = ?
-        """, (url,)).fetchone()
-
-    return {"blog": dict(row)}
-
-
-@app.post("/api/discover/submit")
-def submit_discovery_batch(payload: DiscoveryBatch):
-    if not payload.share:
-        return {"shared": False, "pairs_updated": 0}
-
-    urls = sorted(set(payload.urls))
-
-    if len(urls) < 2:
-        return {"shared": True, "pairs_updated": 0}
-
-    if len(urls) > 100:
-        raise HTTPException(
-            status_code=400,
-            detail="Maximum 100 subscriptions allowed."
-        )
-
-    pairs_updated = 0
-
-    with get_discovery_connection() as connection:
-        known_urls = {
-            row["url"]
-            for row in connection.execute(
-                "SELECT url FROM discovery_blogs"
-            ).fetchall()
-        }
-
-        urls = [url for url in urls if url in known_urls]
-
-        for i in range(len(urls)):
-            for j in range(i + 1, len(urls)):
-                url_a, url_b = sorted((urls[i], urls[j]))
-
-                connection.execute("""
-                    INSERT INTO discovery_pairs (url_a, url_b, pair_count)
-                    VALUES (?, ?, 1)
-                    ON CONFLICT(url_a, url_b)
-                    DO UPDATE SET pair_count = pair_count + 1
-                """, (url_a, url_b))
-
-                pairs_updated += 1
-
-    return {"shared": True, "pairs_updated": pairs_updated}
-
-@app.get("/api/discover/recommend")
-def recommend_blogs(url: str):
-    try:
-        url = validate_public_url(url)
-    except HTTPException:
-        raise
-
-    with get_discovery_connection() as connection:
-        rows = connection.execute("""
-            SELECT
-                CASE
-                    WHEN url_a = ? THEN url_b
-                    ELSE url_a
-                END AS recommended_url,
-                pair_count
-            FROM discovery_pairs
-            WHERE url_a = ? OR url_b = ?
-            ORDER BY pair_count DESC
-        """, (url, url, url)).fetchall()
-
-        recommendations = []
-
-        for row in rows:
-            blog = connection.execute("""
-                SELECT url, name, category, subscriber_count
-                FROM discovery_blogs
-                WHERE url = ?
-            """, (row["recommended_url"],)).fetchone()
-
-            if blog:
-                recommendations.append({
-                    "url": blog["url"],
-                    "name": blog["name"],
-                    "category": blog["category"],
-                    "subscriber_count": blog["subscriber_count"],
-                    "reason": (
-                        "Often followed together with the publication "
-                        "you selected."
-                    ),
-                    "pair_count": row["pair_count"]
-                })
-
-    return {"recommendations": recommendations} 
