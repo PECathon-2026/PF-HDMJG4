@@ -18,7 +18,7 @@ python -m venv .venv
 # Windows PowerShell: .venv\Scripts\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uvicorn main:app --reload --no-access-log --host 127.0.0.1 --port 8000
 ```
 
 ### Frontend
@@ -52,7 +52,7 @@ Do not expose the development server directly to the public internet. For a publ
 
 - SQLite stores community recommendations: name, URL, category, description, and submission timestamp.
 - The backend does not persist fetched HTML/feed responses or personal subscription lists.
-- Rate limiting derives an HMAC digest from the request client's IP using a secret salt. Only the digest is held in an in-memory bucket; raw IPs are not written to the database or logs by this application. In-memory entries expire on cleanup. The limiter resets on process restart and is per process.
+- Rate limiting derives an HMAC digest from the request client's IP using a secret salt. Only the digest is held in an in-memory bucket; the application does not write raw IPs to its database. ASGI/proxy access logs may still capture source IPs unless access logging is disabled or redacted, so production deployment must configure logs accordingly. In-memory entries expire on cleanup. The limiter resets on process restart and is per process.
 
 ### Server-side request forgery (SSRF) defenses
 
@@ -64,8 +64,8 @@ Do not expose the development server directly to the public internet. For a publ
 ### Abuse controls and limitations
 
 - `/api/fetch`: 40 requests per minute per client digest.
-- `POST /api/discover`: 8 submissions per hour per client digest.
-- `GET /api/discover`: 120 reads per minute per client digest.
+- `POST /api/discover` and `POST /api/discover/batch`: 8 submissions per hour per client digest.
+- `GET /api/discover`, `GET /api/discover/popular`, and `POST /api/discover/recommendations`: 120 requests per minute per client digest.
 - Rate limits are in-memory and reset on restart. Multi-worker deployments need a shared limiter. CORS is a browser policy, not authentication, and does not prevent non-browser clients from calling the API.
 - Anonymous community submissions can contain spam. Production deployments should add moderation/reporting and monitoring before scaling.
 
@@ -104,3 +104,29 @@ npm run lint
 8. Try localhost, loopback, private-network IPs, URL credentials, and unsupported URL schemes against `/api/fetch`; each should be rejected.
 9. Send repeated fetch/submission requests and confirm the API eventually returns HTTP 429.
 10. Test a redirecting website; the API should reject the redirect rather than follow it automatically.
+
+## Anonymous community discovery (Priority 2)
+
+The discovery API uses aggregate-only storage. The client submits a subscription batch only after the reader enables anonymous sharing and confirms the action. `POST /api/discover/batch` canonicalizes and deduplicates up to 50 feed URLs, increments each feed's aggregate popularity counter, and increments co-subscription-pair counters. It does **not** store the submitted batch, a batch identifier, or a reader/account identifier. The application does not persist raw IPs; the rate limiter uses a keyed digest in process memory. Production access logs and proxy logs must also be configured to redact or avoid retaining source IPs if that is part of the privacy promise. Configure `OPENFOLIO_RATE_LIMIT_SALT` in production.
+
+Endpoints:
+
+- `GET /api/discover` — discovery directory ranked by aggregate popularity.
+- `GET /api/discover/popular?limit=20` — popular feed list, with a limit from 1 to 50.
+- `POST /api/discover/batch` — explicit anonymous batch contribution (`{"feeds":[{"name":"Example","url":"https://example.com/feed","category":"Technology","description":"Example feed"}]}`). Batch size is capped at 50.
+- `POST /api/discover/recommendations` — recommendations for a supplied list of feed URLs (`{"subscriptions":["https://example.com/feed"]}`). The request's subscription list is used only to calculate the response and is not persisted. The response excludes supplied subscriptions and includes a `reason` field.
+- `POST /api/discover` — legacy single-feed recommendation endpoint retained for compatibility.
+
+The database persists feed-directory metadata and aggregate `popularity_count` values, plus aggregate pairs in `co_subscription_pairs`. It does not store per-reader batches. Pair-based explanations are emitted only when the pair has appeared in at least two anonymous batch contributions. Popularity and co-subscription counts can still be manipulated by repeated submissions; rate limiting is a basic abuse barrier, not proof that each contribution comes from a unique human. For a public deployment, use a shared rate limiter and add moderation/anti-abuse controls.
+
+The startup routine seeds 12 starter blogs idempotently. Seeding is independent of user submissions and does not represent user activity.
+
+### Priority 2 tests
+
+From `backend/`, run:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The discovery tests use a temporary SQLite database and disable DNS lookups for test URLs.

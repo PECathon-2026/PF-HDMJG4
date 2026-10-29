@@ -490,3 +490,32 @@ h1,h2,h3,p{margin-top:0}.welcome-row h1,.page-heading h1,.reader-view h1{font-fa
   color: #66552e;
   font-size: 13px;
 }
+
+
+/* Priority 2: explicit anonymous batch sharing and recommendation explanations. */
+.privacy-detail {
+  margin: 10px 0 14px;
+  max-width: 70ch;
+  color: #66685f;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.recommendation-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 14px 0;
+}
+.recommendation-reason {
+  display: block;
+  margin-top: 6px;
+  color: #536b49;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.privacy-card .primary-button:disabled,
+.recommendation-controls .primary-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

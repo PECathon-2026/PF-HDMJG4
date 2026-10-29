@@ -62,6 +62,29 @@ function cleanExcerpt(value) {
     .trim();
 }
 
+function normalizeCommunityUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+      return String(value || "").trim();
+    }
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    url.hash = "";
+    const trackingKeys = new Set(["fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source"]);
+    const query = [...url.searchParams.entries()]
+      .filter(([key]) => !key.toLowerCase().startsWith("utm_") && !trackingKeys.has(key.toLowerCase()))
+      .sort(([keyA, valueA], [keyB, valueB]) => keyA.toLowerCase().localeCompare(keyB.toLowerCase()) || valueA.localeCompare(valueB));
+    url.search = "";
+    for (const [key, value] of query) url.searchParams.append(key, value);
+    if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+    if ((url.protocol === "https:" && url.port === "443") || (url.protocol === "http:" && url.port === "80")) url.port = "";
+    return url.href;
+  } catch {
+    return String(value || "").trim();
+  }
+}
+
 function normalizeArticleUrl(value, feedUrl) {
   try {
     const url = new URL(value, feedUrl);
@@ -327,6 +350,18 @@ function App() {
   const [communityLoading, setCommunityLoading] = useState(false);
   const [communityError, setCommunityError] = useState("");
   const [submittingUrl, setSubmittingUrl] = useState("");
+
+  // Priority 2: anonymous batch submission state
+const [batchSubmitting, setBatchSubmitting] = useState(false);
+
+// Priority 2: personalized recommendation loading state
+const [personalizedLoading, setPersonalizedLoading] = useState(false);
+
+// Priority 2: personalized recommendation results
+const [
+  personalizedRecommendations,
+  setPersonalizedRecommendations,
+] = useState([]);
 
   // State for choosing a category before recommending a subscription.
   const [recommendCategoryForUrl, setRecommendCategoryForUrl] =
@@ -695,6 +730,94 @@ function App() {
     }
   }
 
+  // Explicitly submit the whole subscription list as one anonymous batch.
+  // The backend stores aggregate feed/pair counts, not this submitted list.
+  async function shareSubscriptionsBatch() {
+    if (!sharing) {
+      setMessage("Turn on anonymous sharing first, then choose Share subscriptions.");
+      return;
+    }
+    if (!feedList.length) {
+      setMessage("Add at least one subscription before sharing.");
+      return;
+    }
+    if (feedList.length > 50) {
+      setMessage("Anonymous batches are limited to 50 subscriptions. Remove some feeds and try again.");
+      return;
+    }
+    if (batchSubmitting) return;
+
+    const confirmed = window.confirm(
+      `Submit ${feedList.length} subscription${feedList.length === 1 ? "" : "s"} as one anonymous batch? Openfolio will keep aggregate popularity and co-subscription counts, not your submitted list.`
+    );
+    if (!confirmed) return;
+
+    setBatchSubmitting(true);
+    setCommunityError("");
+    try {
+      const response = await fetch(`${API}/api/discover/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          feeds: feedList.map((feed) => ({
+            name: feed.name,
+            url: feed.url,
+            category: feed.category || "Personal Blogs",
+            description: feed.description || `A feed shared by an Openfolio reader: ${feed.name}.`,
+          })),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.detail || "Could not submit the anonymous batch.");
+      }
+
+      const refresh = await fetch(`${API}/api/discover/popular`);
+      if (refresh.ok) {
+        const directory = await refresh.json();
+        setCommunityRecommendations(
+          Array.isArray(directory.recommendations) ? directory.recommendations : []
+        );
+      }
+      setMessage(
+        `Shared ${result.accepted_feeds} unique feeds. ${result.deduplicated_feeds} duplicate URL${result.deduplicated_feeds === 1 ? " was" : "s were"} removed. Only aggregate counts were saved.`
+      );
+    } catch (error) {
+      setCommunityError(error.message || "Could not submit the anonymous batch.");
+    } finally {
+      setBatchSubmitting(false);
+    }
+  }
+
+  // The list is sent only after the reader presses this button. The API uses
+  // it for this response and does not persist the supplied subscription list.
+  async function loadPersonalizedRecommendations() {
+    if (personalizedLoading) return;
+    setPersonalizedLoading(true);
+    setCommunityError("");
+    try {
+      const response = await fetch(`${API}/api/discover/recommendations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscriptions: feedList.map((feed) => feed.url) }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.detail || "Could not generate recommendations.");
+      }
+      setPersonalizedRecommendations(
+        Array.isArray(result.recommendations) ? result.recommendations : []
+      );
+      setMessage(
+        `Found ${result.recommendations?.length || 0} recommendations, excluding feeds you already follow.`
+      );
+    } catch (error) {
+      setCommunityError(error.message || "Could not generate recommendations.");
+    } finally {
+      setPersonalizedLoading(false);
+    }
+  }
+
   function markRead(article) {
     const updated = { ...article, read: true };
 
@@ -730,13 +853,18 @@ function App() {
     ...communityRecommendations.map((feed) => ({
       ...feed,
       tags: [feed.category || "Writing"],
-      source: "community",
+      source: feed.is_seed ? "starter" : "community",
+    })),
+    ...personalizedRecommendations.map((feed) => ({
+      ...feed,
+      tags: [feed.category || "Writing"],
+      source: "personalized",
     })),
   ];
 
   // Show only one entry for each URL.
   const uniqueRecommendations = Array.from(
-    new Map(allRecommendations.map((feed) => [feed.url, feed])).values()
+    new Map(allRecommendations.map((feed) => [normalizeCommunityUrl(feed.url), feed])).values()
   );
 
   const filteredRecommendations = uniqueRecommendations.filter((feed) => {
@@ -750,8 +878,11 @@ function App() {
     const matchesCategory =
       discoverCategory === "All" ||
       (feed.tags || []).includes(discoverCategory);
+    const matchesNotFollowed = !feedList.some(
+      (savedFeed) => normalizeCommunityUrl(savedFeed.url) === normalizeCommunityUrl(feed.url)
+    );
 
-    return matchesSearch && matchesCategory;
+    return matchesSearch && matchesCategory && matchesNotFollowed;
   });
 
   return (
@@ -813,7 +944,7 @@ function App() {
 
         {feedList.map((feed) => {
           const alreadyRecommended = communityRecommendations.some(
-            (savedFeed) => savedFeed.url === feed.url
+            (savedFeed) => normalizeCommunityUrl(savedFeed.url) === normalizeCommunityUrl(feed.url) && !savedFeed.is_seed
           );
 
           const categoryFormOpen = recommendCategoryForUrl === feed.url;
@@ -1089,9 +1220,20 @@ function App() {
 
                 <small>
                   {sharing
-                    ? "This toggle is a local demo setting. It does not automatically submit anything."
-                    : "Sharing is off. No recommendation is submitted automatically."}
+                    ? "Sharing is enabled, but nothing is sent until you press the button and confirm."
+                    : "Sharing is off. Your subscriptions are not submitted."}
                 </small>
+                <p className="privacy-detail">
+                  A batch request includes your feed URLs temporarily so the server can count popularity and co-subscriptions. It does not save the submitted list, a batch ID, an account ID, or a raw IP address. Recommendation requests also send feed URLs only when you ask for them.
+                </p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={!sharing || !feedList.length || batchSubmitting}
+                  onClick={shareSubscriptionsBatch}
+                >
+                  {batchSubmitting ? "Sharing batch…" : `Share ${feedList.length} subscriptions anonymously`}
+                </button>
               </div>
             </div>
 
@@ -1138,6 +1280,28 @@ function App() {
               ))}
             </div>
 
+            <div className="recommendation-controls">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={personalizedLoading || !feedList.length}
+                onClick={loadPersonalizedRecommendations}
+              >
+                {personalizedLoading
+                  ? "Finding recommendations…"
+                  : "Recommend based on my subscriptions"}
+              </button>
+              {personalizedRecommendations.length > 0 && (
+                <button
+                  type="button"
+                  className="recommend-cancel-button"
+                  onClick={() => setPersonalizedRecommendations([])}
+                >
+                  Clear personalized results
+                </button>
+              )}
+            </div>
+
             <p className="discover-result-count">
               {filteredRecommendations.length}{" "}
               {filteredRecommendations.length === 1
@@ -1147,11 +1311,11 @@ function App() {
 
             {filteredRecommendations.map((feed, index) => {
               const alreadyAdded = feedList.some(
-                (savedFeed) => savedFeed.url === feed.url
+                (savedFeed) => normalizeCommunityUrl(savedFeed.url) === normalizeCommunityUrl(feed.url)
               );
 
               const alreadyRecommended = communityRecommendations.some(
-                (savedFeed) => savedFeed.url === feed.url
+                (savedFeed) => normalizeCommunityUrl(savedFeed.url) === normalizeCommunityUrl(feed.url) && !savedFeed.is_seed
               );
 
               return (
@@ -1164,9 +1328,16 @@ function App() {
                     <strong>{feed.name}</strong>
                     <p>{(feed.tags || []).join(" · ")}</p>
                     <p>{feed.description}</p>
+                    {feed.reason && <small className="recommendation-reason">Why this is suggested: {feed.reason}</small>}
+                    {feed.popularity_count >= 3 && (
+                      <small>{feed.popularity_count} anonymous batch contributions</small>
+                    )}
 
                     {feed.source === "community" && (
                       <small>Community recommendation</small>
+                    )}
+                    {feed.source === "personalized" && (
+                      <small>Personalized · based on aggregate co-subscription patterns</small>
                     )}
                   </div>
 

@@ -14,7 +14,7 @@ import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import closing
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -150,8 +150,21 @@ def normalize_public_url(url: str, *, resolve_dns: bool = True) -> str:
     else:
         netloc = netloc_host
 
+    # Canonicalize common equivalent URLs: remove fragments/tracking parameters,
+    # sort remaining query parameters, and trim non-root trailing slashes.
     path = parsed.path or "/"
-    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    tracking_keys = {"fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source"}
+    query_pairs = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered.startswith("utm_") or lowered in tracking_keys:
+            continue
+        query_pairs.append((key, value))
+    query_pairs.sort(key=lambda pair: (pair[0].lower(), pair[1]))
+    canonical_query = urlencode(query_pairs, doseq=True)
+    return urlunsplit((scheme, netloc, path, canonical_query, ""))
 
 
 class PublicOnlyResolver(aiohttp.abc.AbstractResolver):
@@ -202,6 +215,22 @@ class PublicOnlyResolver(aiohttp.abc.AbstractResolver):
         return None
 
 
+STARTER_FEEDS = [
+    {"name": "NASA", "url": "https://www.nasa.gov/feed/", "category": "Science", "description": "Space missions, science news, and discoveries."},
+    {"name": "Smashing Magazine", "url": "https://www.smashingmagazine.com/feed/", "category": "Design", "description": "Web design, accessibility, and frontend craft."},
+    {"name": "Cloudflare Blog", "url": "https://blog.cloudflare.com/rss/", "category": "Technology", "description": "Internet infrastructure, security, and engineering."},
+    {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/", "category": "Personal Blogs", "description": "Programming, data, AI, and small experiments."},
+    {"name": "The Marginalian", "url": "https://www.themarginalian.org/feed/", "category": "Writing", "description": "Essays about creativity, meaning, science, and art."},
+    {"name": "Hacker News", "url": "https://hnrss.org/frontpage", "category": "Technology", "description": "Community-submitted technology stories and discussions."},
+    {"name": "KrebsOnSecurity", "url": "https://krebsonsecurity.com/feed/", "category": "Technology", "description": "Investigative reporting on cybersecurity and online crime."},
+    {"name": "Mozilla Hacks", "url": "https://hacks.mozilla.org/feed/", "category": "Technology", "description": "Web platform, browser, and developer articles."},
+    {"name": "NPR News", "url": "https://feeds.npr.org/1001/rss.xml", "category": "Writing", "description": "News reporting and features from NPR."},
+    {"name": "MIT Technology Review", "url": "https://www.technologyreview.com/feed/", "category": "Science", "description": "Reporting on emerging technology and scientific research."},
+    {"name": "Ars Technica", "url": "https://feeds.arstechnica.com/arstechnica/index", "category": "Technology", "description": "Technology, science, policy, and computing coverage."},
+    {"name": "CSS-Tricks", "url": "https://css-tricks.com/feed/", "category": "Design", "description": "Frontend development, CSS, and web design techniques."},
+]
+
+
 def init_database():
     with closing(sqlite3.connect(DATABASE)) as db:
         db.execute("""
@@ -214,12 +243,58 @@ def init_database():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        columns = {row[1] for row in db.execute("PRAGMA table_info(recommendations)")}
+        if "popularity_count" not in columns:
+            db.execute("ALTER TABLE recommendations ADD COLUMN popularity_count INTEGER NOT NULL DEFAULT 0")
+        if "is_seed" not in columns:
+            db.execute("ALTER TABLE recommendations ADD COLUMN is_seed INTEGER NOT NULL DEFAULT 0")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS co_subscription_pairs (
+                url_a TEXT NOT NULL,
+                url_b TEXT NOT NULL,
+                contribution_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (url_a, url_b),
+                CHECK (url_a < url_b)
+            )
+        """)
+        # Canonicalize existing directory entries too, merging legacy duplicates.
+        # This migration stores feed metadata/counts only, never reader batches.
+        existing_rows = db.execute(
+            "SELECT id, url, popularity_count FROM recommendations ORDER BY id ASC"
+        ).fetchall()
+        canonical_groups = {}
+        for row_id, old_url, popularity_count in existing_rows:
+            try:
+                canonical_url = normalize_public_url(old_url, resolve_dns=False)
+            except HTTPException:
+                continue
+            canonical_groups.setdefault(canonical_url, []).append((row_id, popularity_count))
+        for canonical_url, group in canonical_groups.items():
+            survivor_id = group[0][0]
+            merged_popularity = sum(int(item[1] or 0) for item in group)
+            duplicate_ids = [item[0] for item in group[1:]]
+            if duplicate_ids:
+                db.executemany(
+                    "DELETE FROM recommendations WHERE id = ?",
+                    [(row_id,) for row_id in duplicate_ids],
+                )
+            db.execute(
+                "UPDATE recommendations SET url = ?, popularity_count = ? WHERE id = ?",
+                (canonical_url, merged_popularity, survivor_id),
+            )
+        # Seed the discovery directory idempotently. Seeds are directory entries,
+        # not a record of anyone's personal subscription list.
+        for feed in STARTER_FEEDS:
+            canonical_url = normalize_public_url(feed["url"], resolve_dns=False)
+            db.execute("""
+                INSERT OR IGNORE INTO recommendations
+                    (name, url, category, description, popularity_count, is_seed)
+                VALUES (?, ?, ?, ?, 0, 1)
+            """, (feed["name"], canonical_url, feed["category"], feed["description"]))
+            # If a seed URL was already submitted before this seed list existed,
+            # mark that existing directory entry as seeded without losing its count.
+            db.execute("UPDATE recommendations SET is_seed = 1 WHERE url = ?", (canonical_url,))
         db.commit()
-
-
-@app.on_event("startup")
-def startup():
-    init_database()
 
 
 class RecommendationInput(BaseModel):
@@ -227,6 +302,30 @@ class RecommendationInput(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
     category: str = Field(min_length=1, max_length=40)
     description: str = Field(min_length=1, max_length=300)
+
+    class Config:
+        extra = "forbid"
+
+
+class BatchFeedInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=8, max_length=2048)
+    category: str = Field(default="Personal Blogs", min_length=1, max_length=40)
+    description: str = Field(default="An anonymously shared feed.", min_length=1, max_length=300)
+
+    class Config:
+        extra = "forbid"
+
+
+class AnonymousBatchInput(BaseModel):
+    feeds: list[BatchFeedInput] = Field(min_length=1, max_length=50)
+
+    class Config:
+        extra = "forbid"
+
+
+class RecommendationQueryInput(BaseModel):
+    subscriptions: list[str] = Field(default_factory=list, max_length=100)
 
     class Config:
         extra = "forbid"
@@ -346,22 +445,46 @@ async def removed_article_endpoint():
     )
 
 
+def _directory_rows(db, *, limit=200, order="popularity"):
+    db.row_factory = sqlite3.Row
+    if order == "popularity":
+        rows = db.execute("""
+            SELECT id, name, url, category, description, created_at,
+                   popularity_count, is_seed
+            FROM recommendations
+            ORDER BY popularity_count DESC, is_seed DESC, name COLLATE NOCASE ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    else:
+        rows = db.execute("""
+            SELECT id, name, url, category, description, created_at,
+                   popularity_count, is_seed
+            FROM recommendations
+            ORDER BY name COLLATE NOCASE ASC LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.get("/api/discover")
 def get_recommendations(request: Request):
+    """Compatibility directory endpoint, now ranked by aggregate popularity."""
     enforce_rate_limit(request, "discover_get")
     with closing(sqlite3.connect(DATABASE)) as db:
-        db.row_factory = sqlite3.Row
-        rows = db.execute("""
-            SELECT id, name, url, category, description, created_at
-            FROM recommendations
-            ORDER BY created_at DESC, id DESC
-            LIMIT 200
-        """).fetchall()
-    return {"recommendations": [dict(row) for row in rows]}
+        recommendations = _directory_rows(db)
+    return {"recommendations": recommendations}
+
+
+@app.get("/api/discover/popular")
+def get_popular_feeds(request: Request, limit: int = Query(20, ge=1, le=50)):
+    enforce_rate_limit(request, "discover_get")
+    with closing(sqlite3.connect(DATABASE)) as db:
+        recommendations = _directory_rows(db, limit=limit)
+    return {"recommendations": recommendations}
 
 
 @app.post("/api/discover", status_code=201)
 def submit_recommendation(request: Request, recommendation: RecommendationInput):
+    """Legacy single-feed submission retained for compatibility."""
     enforce_rate_limit(request, "discover_post")
     name = recommendation.name.strip()
     category = recommendation.category.strip()
@@ -373,21 +496,140 @@ def submit_recommendation(request: Request, recommendation: RecommendationInput)
     try:
         with closing(sqlite3.connect(DATABASE, timeout=5)) as db:
             cursor = db.execute("""
-                INSERT INTO recommendations (name, url, category, description)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO recommendations
+                    (name, url, category, description, popularity_count, is_seed)
+                VALUES (?, ?, ?, ?, 1, 0)
+                ON CONFLICT(url) DO UPDATE SET
+                    popularity_count = recommendations.popularity_count + 1
             """, (name, url, category, description))
             db.commit()
-            new_id = cursor.lastrowid
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "This feed has already been recommended.")
+            row = db.execute(
+                "SELECT id, name, url, category, description, popularity_count FROM recommendations WHERE url = ?",
+                (url,),
+            ).fetchone()
     except sqlite3.Error:
         raise HTTPException(500, "Could not save recommendation.")
 
     return {
-        "id": new_id,
-        "name": name,
-        "url": url,
-        "category": category,
-        "description": description,
+        "id": row[0], "name": row[1], "url": row[2], "category": row[3],
+        "description": row[4], "popularity_count": row[5],
         "message": "Recommendation submitted.",
     }
+
+
+@app.post("/api/discover/batch", status_code=201)
+def submit_anonymous_batch(request: Request, batch: AnonymousBatchInput):
+    """Store aggregate counts only; never persist the submitted batch or client IP."""
+    enforce_rate_limit(request, "discover_post")
+    canonical_feeds = {}
+    for feed in batch.feeds:
+        url = normalize_public_url(feed.url.strip(), resolve_dns=True)
+        # Canonical URL is the deduplication key. First entry wins within a batch.
+        canonical_feeds.setdefault(url, {
+            "name": feed.name.strip(),
+            "url": url,
+            "category": feed.category.strip() or "Personal Blogs",
+            "description": feed.description.strip() or "An anonymously shared feed.",
+        })
+    if not canonical_feeds:
+        raise HTTPException(400, "Add at least one valid feed before sharing.")
+
+    urls = sorted(canonical_feeds)
+    try:
+        with closing(sqlite3.connect(DATABASE, timeout=10)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for feed in canonical_feeds.values():
+                db.execute("""
+                    INSERT INTO recommendations
+                        (name, url, category, description, popularity_count, is_seed)
+                    VALUES (?, ?, ?, ?, 1, 0)
+                    ON CONFLICT(url) DO UPDATE SET
+                        popularity_count = recommendations.popularity_count + 1
+                """, (feed["name"], feed["url"], feed["category"], feed["description"]))
+
+            # Persist only aggregate pair counts. No batch ID, account ID, raw IP,
+            # or per-reader subscription list is stored.
+            for index, url_a in enumerate(urls):
+                for url_b in urls[index + 1:]:
+                    db.execute("""
+                        INSERT INTO co_subscription_pairs (url_a, url_b, contribution_count)
+                        VALUES (?, ?, 1)
+                        ON CONFLICT(url_a, url_b) DO UPDATE SET
+                            contribution_count = contribution_count + 1
+                    """, (url_a, url_b))
+            db.commit()
+    except sqlite3.Error:
+        raise HTTPException(500, "Could not save anonymous aggregate counts.")
+
+    return {
+        "accepted_feeds": len(urls),
+        "deduplicated_feeds": len(batch.feeds) - len(urls),
+        "stored": "aggregate popularity and co-subscription counts only",
+        "message": "Anonymous batch processed. The submitted batch itself was not stored.",
+    }
+
+
+@app.post("/api/discover/recommendations")
+def recommend_for_subscriptions(request: Request, query: RecommendationQueryInput):
+    """Return recommendations for supplied URLs without persisting that URL list."""
+    enforce_rate_limit(request, "discover_get")
+    subscribed = set()
+    for raw_url in query.subscriptions:
+        try:
+            subscribed.add(normalize_public_url(raw_url, resolve_dns=False))
+        except HTTPException:
+            # Ignore invalid values rather than failing the whole recommendation request.
+            continue
+
+    with closing(sqlite3.connect(DATABASE)) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("""
+            SELECT url_a, url_b, contribution_count
+            FROM co_subscription_pairs
+            WHERE contribution_count >= 2
+        """).fetchall()
+        pair_scores = {}
+        pair_sources = {}
+        for row in rows:
+            a, b, count = row["url_a"], row["url_b"], row["contribution_count"]
+            if a in subscribed and b not in subscribed:
+                candidate, source = b, a
+            elif b in subscribed and a not in subscribed:
+                candidate, source = a, b
+            else:
+                continue
+            pair_scores[candidate] = pair_scores.get(candidate, 0) + count
+            if candidate not in pair_sources or count > pair_sources[candidate][1]:
+                pair_sources[candidate] = (source, count)
+
+        rows = db.execute("""
+            SELECT id, name, url, category, description, created_at,
+                   popularity_count, is_seed
+            FROM recommendations
+        """).fetchall()
+
+    directory = {row["url"]: dict(row) for row in rows}
+    candidates = [feed for url, feed in directory.items() if url not in subscribed]
+    candidates.sort(
+        key=lambda feed: (pair_scores.get(feed["url"], 0), feed.get("popularity_count", 0), feed["is_seed"], feed["name"].lower()),
+        reverse=True,
+    )
+    output = []
+    for feed in candidates[:30]:
+        pair_info = pair_sources.get(feed["url"])
+        if pair_info and pair_info[0] in directory:
+            source_name = directory[pair_info[0]]["name"]
+            reason = f"Often followed alongside {source_name}."
+        elif feed.get("popularity_count", 0) >= 3:
+            reason = "Frequently included in anonymous reader submissions."
+        else:
+            reason = f"A starter suggestion in {feed['category']}."
+        feed["reason"] = reason
+        feed["recommendation_basis"] = "co_subscription" if pair_info else "popularity_or_seed"
+        output.append(feed)
+
+    return {"recommendations": output, "excluded_count": len(subscribed)}
+
+@app.on_event("startup")
+def startup_event():
+    init_database()
