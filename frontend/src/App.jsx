@@ -1,4 +1,4 @@
-
+import { XMLParser } from "fast-xml-parser";
 import { useState } from "react";
 import "./App.css";
 
@@ -14,6 +14,86 @@ const starterFeeds = [
   { name: "Notes from Elsewhere", url: "https://example.org/feed", count: 8 },
   { name: "Small Wonders", url: "https://example.net/feed", count: 5 },
 ];
+
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text",
+  trimValues: true,
+});
+
+function textValue(value) {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  if (value && typeof value === "object" && "#text" in value) {
+    return String(value["#text"]);
+  }
+  return "";
+}
+
+function parseFeed(xml, feedName, feedUrl) {
+  const parsed = xmlParser.parse(xml);
+  const root = parsed.rss?.channel || parsed.feed;
+
+  if (!root) {
+    throw new Error("This doesn't look like a supported RSS or Atom feed.");
+  }
+
+  const entries = root.item
+    ? (Array.isArray(root.item) ? root.item : [root.item])
+    : root.entry
+      ? (Array.isArray(root.entry) ? root.entry : [root.entry])
+      : [];
+
+  if (!entries.length) {
+    throw new Error("No articles were found in this feed.");
+  }
+
+  return entries.map((entry, index) => {
+    const linkValue = entry.link;
+    let articleUrl = "";
+
+    if (typeof linkValue === "string") {
+      articleUrl = linkValue;
+    } else if (Array.isArray(linkValue)) {
+      const alternate = linkValue.find(
+        (link) => link["@_rel"] === "alternate" || !link["@_rel"]
+      );
+      articleUrl = alternate?.["@_href"] || "";
+    } else if (linkValue && typeof linkValue === "object") {
+      articleUrl = linkValue["@_href"] || "";
+    }
+
+    articleUrl ||= textValue(entry.guid || entry.id) || feedUrl;
+
+    const rawDate = textValue(
+      entry.pubDate || entry.published || entry.updated
+    );
+
+    const rawDescription = textValue(
+      entry.description || entry.summary || entry.content
+    );
+
+    const excerpt = rawDescription.replace(/<[^>]*>/g, "").trim();
+
+    return {
+      id: `${feedUrl}-${index}-${articleUrl}`,
+      category: "ARTICLE",
+      title: textValue(entry.title) || "Untitled article",
+      blog: feedName,
+      date: rawDate
+        ? new Date(rawDate).toLocaleDateString()
+        : "Date unavailable",
+      timestamp: rawDate ? Date.parse(rawDate) || 0 : 0,
+      read: false,
+      color: ["peach", "blue", "green", "lavender"][index % 4],
+      excerpt: excerpt.slice(0, 350) || "Open this article to read more.",
+      url: articleUrl,
+      feedUrl,
+    };
+  });
+}
 
 function App() {
   const [page, setPage] = useState("All articles");
@@ -34,23 +114,85 @@ function App() {
     return matchesSearch && matchesUnread && matchesPage && matchesFeed;
   });
 
-  function addFeed(event) {
-    event.preventDefault();
-    const url = feedUrl.trim();
-    try {
-      const parsed = new URL(url);
-      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error();
-      if (feedList.some((feed) => feed.url === url)) {
-        setMessage("This feed is already in your subscriptions.");
-        return;
-      }
-      setFeedList((current) => [...current, { name: parsed.hostname, url, count: 0 }]);
-      setFeedUrl("");
-      setMessage("Feed saved to this session. Live feed fetching is the next step.");
-    } catch {
-      setMessage("Enter a valid http:// or https:// feed URL.");
+  
+  
+async function addFeed(event) {
+  event.preventDefault();
+
+  const url = feedUrl.trim();
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(url);
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      throw new Error("Only HTTP and HTTPS feed URLs are supported.");
     }
+  } catch {
+    setMessage("Enter a valid HTTP or HTTPS feed URL.");
+    return;
   }
+
+  if (feedList.some((feed) => feed.url === url)) {
+    setMessage("This feed is already in your subscriptions.");
+    return;
+  }
+
+  setMessage("Fetching and parsing the feed...");
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:8000/api/fetch?url=${encodeURIComponent(url)}`
+    );
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      throw new Error(result.detail || "Unable to fetch this feed.");
+    }
+
+    const contentType = result.content_type || "";
+    if (
+      contentType &&
+      !contentType.includes("xml") &&
+      !contentType.includes("rss") &&
+      !contentType.includes("atom") &&
+      !contentType.includes("text/plain")
+    ) {
+      throw new Error(
+        "This URL returned a webpage, not an obvious RSS or Atom feed. Try the feed URL."
+      );
+    }
+
+    const name = parsedUrl.hostname.replace(/^www\./, "");
+    const newArticles = parseFeed(result.body, name, url);
+
+    setFeedList((current) => [
+      ...current,
+      { name, url, count: newArticles.length },
+    ]);
+
+    setItems((current) => {
+      const existingIds = new Set(current.map((item) => item.id));
+      const uniqueArticles = newArticles.filter(
+        (item) => !existingIds.has(item.id)
+      );
+
+      return [...current, ...uniqueArticles].sort(
+        (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
+      );
+    });
+
+    setPage(name);
+    setSelected(null);
+    setFeedUrl("");
+    setMessage(
+      `Successfully loaded ${newArticles.length} articles from ${name}.`
+    );
+  } catch (error) {
+    setMessage(error.message || "Unable to load this feed.");
+  }
+}
+
 
   function markRead(article) {
     setItems((current) => current.map((item) => item.id === article.id ? { ...item, read: true } : item));
