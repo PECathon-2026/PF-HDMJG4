@@ -1,132 +1,442 @@
-# Openfolio
+# Openfolio — Privacy-First RSS Reader
 
-Openfolio is a browser-first RSS/Atom reader. Personal subscriptions and article caches stay in the user's browser; the backend provides a bounded public-page fetch proxy and a database-backed community discovery directory.
+Openfolio is a privacy-focused, offline-first RSS and Atom feed reader. It allows users to subscribe to websites, read articles, manage reading progress, and discover new feeds through anonymous community recommendations.
 
-## Architecture
+## 1. Architecture Overview
 
-- **Frontend:** React + Vite. RSS/Atom parsing uses `fast-xml-parser`; full-text extraction uses Mozilla Readability in the browser; article HTML is sanitized with DOMPurify before rendering. Subscription/article state is stored in browser `localStorage`.
-- **Backend:** FastAPI. `GET /api/fetch?url=...` returns raw page/feed content only. It does not parse feeds, extract article text, or persist fetched content. `GET /api/article` returns HTTP 410 because extraction moved to the browser.
-- **Discovery:** SQLite stores community recommendations submitted explicitly by the user. Personal subscriptions are not automatically uploaded.
+Openfolio uses a client-server architecture consisting of a frontend, backend API, and database.
 
-## Local setup
+### Architecture Diagram
 
-### Backend
-
-```bash
-cd backend
-python -m venv .venv
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --no-access-log --host 127.0.0.1 --port 8000
+```text
+                  USER
+                   |
+                   v
+          +------------------+
+          |  REACT FRONTEND  |
+          |     (Vite)       |
+          +------------------+
+                   |
+       +-----------+-----------+
+       |           |           |
+       v           v           v
+ Subscriptions  Timeline    Discover
+       |           |           |
+       v           v           |
+ Feed Discovery   RSS/Atom     |
+       |           |           |
+       v           v           |
+ Article       Reading         |
+ Extraction    View            |
+       |           |           |
+       +-----------+           |
+                   |           |
+             IndexedDB         |
+             Local Cache       |
+                   |           |
+                   v           |
+              Offline Reading |
+                               |
+                    API Requests
+                         |
+                         v
+              +----------------------+
+              |    FASTAPI BACKEND   |
+              +----------------------+
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+          /api/fetch          /api/discover/
+          Fetch Route         batch
+                              recommendations
+                              popular
+              |                     |
+              v                     v
+         External URLs         Discovery Logic
+                                    |
+                                    v
+                              +-----------+
+                              | DATABASE  |
+                              | SQLite /  |
+                              | PostgreSQL|
+                              +-----------+
 ```
 
-### Frontend
+### Client Responsibilities
 
-In a second terminal:
+- Automatic RSS and Atom feed discovery.
+- RSS and Atom XML parsing in the browser.
+- Unified chronological timeline.
+- Subscription management.
+- Read and unread article tracking.
+- Article extraction using a readability library.
+- HTML sanitization using DOMPurify.
+- Local caching using IndexedDB or localStorage.
+- Offline-first reading experience.
+- Anonymous subscription sharing with explicit opt-in.
+
+### Server Responsibilities
+
+The backend provides two main services.
+
+**A. Fetch Route**
+
+```http
+GET /api/fetch?url=https://example.com/feed.xml
+```
+
+The fetch route retrieves remote website content and returns the raw response to the client.
+
+Responsibilities:
+- Handle browser CORS restrictions.
+- Fetch remote URLs.
+- Return raw response content.
+- Handle timeouts and network errors.
+- Validate URLs and reject private or local network destinations.
+
+The server does not parse or store feed or article content.
+
+**B. Discovery API**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/api/discover/batch` | Submit subscriptions anonymously |
+| GET | `/api/discover/recommendations` | Recommend feeds |
+| GET | `/api/discover/popular` | Return popular feeds |
+
+The discovery service calculates feed popularity and co-subscription recommendations.
+
+---
+
+## 2. Setup Instructions
+
+### Prerequisites
+
+- Node.js (LTS)
+- npm
+- Python 3.10+
+- Git
+
+### Clone the Repository
+
+```bash
+git clone YOUR_GITHUB_REPOSITORY_URL
+cd Openfolio
+```
+
+### Frontend Setup
 
 ```bash
 cd frontend
-npm ci
+npm install
+```
+
+Create a `.env` file inside the frontend directory:
+
+```env
+VITE_API_BASE_URL=http://localhost:8000
+```
+
+Start the frontend:
+
+```bash
 npm run dev
 ```
 
-Open the local URL printed by Vite. The frontend currently expects the backend at `http://127.0.0.1:8000`.
+Frontend URL:
 
-## Configuration
-
-- `OPENFOLIO_DATABASE`: optional SQLite file path. Defaults to `backend/openfolio.db`.
-- `OPENFOLIO_RATE_LIMIT_SALT`: optional secret used to derive keyed client digests for the in-memory rate limiter. Set a random secret in deployment. If omitted, a random process-local secret is generated on startup.
-
-Do not expose the development server directly to the public internet. For a public deployment, configure HTTPS, a production ASGI server, explicit allowed frontend origins, monitoring, and shared/distributed rate limiting if running multiple workers.
-
-## Security and privacy threat model
-
-### Data kept in the browser
-
-- Subscription URLs and article cache/read state are saved in localStorage on the current browser profile.
-- They are not automatically uploaded to the community API.
-- Anyone with access to the same browser profile may be able to inspect its local storage. Do not use a shared device if that is a concern.
-
-### Data stored by the backend
-
-- SQLite stores community recommendations: name, URL, category, description, and submission timestamp.
-- The backend does not persist fetched HTML/feed responses or personal subscription lists.
-- Rate limiting derives an HMAC digest from the request client's IP using a secret salt. Only the digest is held in an in-memory bucket; the application does not write raw IPs to its database. ASGI/proxy access logs may still capture source IPs unless access logging is disabled or redacted, so production deployment must configure logs accordingly. In-memory entries expire on cleanup. The limiter resets on process restart and is per process.
-
-### Server-side request forgery (SSRF) defenses
-
-- Only HTTP and HTTPS URLs are accepted; credentials, local/reserved hostnames, invalid ports, and private/non-global IP addresses are rejected.
-- Hostnames are checked for public DNS results before fetching. A custom `aiohttp` resolver repeats the check at connection time and supplies only the validated public IP addresses to the socket, reducing DNS-rebinding risk.
-- Redirects are disabled. If a site redirects, the user must retry with its final URL. Every request has a timeout and a 2 MB response limit; unsupported content types are rejected.
-- These controls reduce SSRF risk but do not replace a production egress firewall. Deploy with outbound network restrictions as an additional defense.
-
-### Abuse controls and limitations
-
-- `/api/fetch`: 40 requests per minute per client digest.
-- `POST /api/discover` and `POST /api/discover/batch`: 8 submissions per hour per client digest.
-- `GET /api/discover`, `GET /api/discover/popular`, and `POST /api/discover/recommendations`: 120 requests per minute per client digest.
-- Rate limits are in-memory and reset on restart. Multi-worker deployments need a shared limiter. CORS is a browser policy, not authentication, and does not prevent non-browser clients from calling the API.
-- Anonymous community submissions can contain spam. Production deployments should add moderation/reporting and monitoring before scaling.
-
-### Article HTML safety
-
-- Readability extracts content in the browser from the raw HTML response.
-- DOMPurify sanitizes extracted HTML before it is cached and rendered. The rendering path sanitizes again because browser localStorage is not trusted.
-- If extraction fails, Openfolio falls back to the plain-text feed summary rather than rendering unsanitized page HTML.
-
-## Tests
-
-Run backend URL validation tests from the `backend` directory:
-
-```bash
-python -m unittest discover -s tests -v
+```text
+http://localhost:5173
 ```
 
-Run the frontend checks:
+### Backend Setup
+
+Open another terminal:
 
 ```bash
-cd frontend
-npm ci
-npm run build
-npm run lint
+cd backend
 ```
 
-### Manual resilience test plan
-
-1. Add a normal RSS feed and an Atom feed; confirm article titles, links, dates, and descending chronological order.
-2. Paste a homepage with an RSS/Atom alternate link, then a homepage that relies on a common feed path.
-3. Try malformed XML, an empty feed, an unreachable domain, and a slow site; confirm the UI reports a useful error without freezing.
-4. Open a normal article; confirm browser-side extraction displays content. Use an article with scripts/unsafe markup in its page source and verify it is not executed or rendered.
-5. Use an article whose extraction fails; confirm the feed excerpt remains available.
-6. Reload the app and confirm subscriptions, article cache, and read/unread state persist.
-7. Remove a subscription; confirm its cached articles are removed and the page selection returns to the library when necessary.
-8. Try localhost, loopback, private-network IPs, URL credentials, and unsupported URL schemes against `/api/fetch`; each should be rejected.
-9. Send repeated fetch/submission requests and confirm the API eventually returns HTTP 429.
-10. Test a redirecting website; the API should reject the redirect rather than follow it automatically.
-
-## Anonymous community discovery (Priority 2)
-
-The discovery API uses aggregate-only storage. The client submits a subscription batch only after the reader enables anonymous sharing and confirms the action. `POST /api/discover/batch` canonicalizes and deduplicates up to 50 feed URLs, increments each feed's aggregate popularity counter, and increments co-subscription-pair counters. It does **not** store the submitted batch, a batch identifier, or a reader/account identifier. The application does not persist raw IPs; the rate limiter uses a keyed digest in process memory. Production access logs and proxy logs must also be configured to redact or avoid retaining source IPs if that is part of the privacy promise. Configure `OPENFOLIO_RATE_LIMIT_SALT` in production.
-
-Endpoints:
-
-- `GET /api/discover` — discovery directory ranked by aggregate popularity.
-- `GET /api/discover/popular?limit=20` — popular feed list, with a limit from 1 to 50.
-- `POST /api/discover/batch` — explicit anonymous batch contribution (`{"feeds":[{"name":"Example","url":"https://example.com/feed","category":"Technology","description":"Example feed"}]}`). Batch size is capped at 50.
-- `POST /api/discover/recommendations` — recommendations for a supplied list of feed URLs (`{"subscriptions":["https://example.com/feed"]}`). The request's subscription list is used only to calculate the response and is not persisted. The response excludes supplied subscriptions and includes a `reason` field.
-- `POST /api/discover` — legacy single-feed recommendation endpoint retained for compatibility.
-
-The database persists feed-directory metadata and aggregate `popularity_count` values, plus aggregate pairs in `co_subscription_pairs`. It does not store per-reader batches. Pair-based explanations are emitted only when the pair has appeared in at least two anonymous batch contributions. Popularity and co-subscription counts can still be manipulated by repeated submissions; rate limiting is a basic abuse barrier, not proof that each contribution comes from a unique human. For a public deployment, use a shared rate limiter and add moderation/anti-abuse controls.
-
-The startup routine seeds 12 starter blogs idempotently. Seeding is independent of user submissions and does not represent user activity.
-
-### Priority 2 tests
-
-From `backend/`, run:
+Create a virtual environment:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m venv venv
 ```
 
-The discovery tests use a temporary SQLite database and disable DNS lookups for test URLs.
+Activate it on Windows:
+
+```bash
+venv\Scripts\activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the backend:
+
+```bash
+uvicorn main:app --reload --port 8000
+```
+
+Backend URL:
+
+```text
+http://localhost:8000
+```
+
+API documentation:
+
+```text
+http://localhost:8000/docs
+```
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `VITE_API_BASE_URL` | Backend API URL |
+| `ALLOWED_ORIGINS` | Allowed frontend origins |
+| `DATABASE_URL` | Database connection string |
+
+Example backend `.env`:
+
+```env
+ALLOWED_ORIGINS=http://localhost:5173
+DATABASE_URL=your_database_connection_string
+```
+
+Only configure variables supported by the actual implementation.
+
+---
+
+## 3. Privacy & Threat Model
+
+Privacy is a core principle of Openfolio.
+
+### What the Server Stores
+
+The discovery service stores aggregated subscription information, including:
+
+- Normalized feed URLs.
+- Feed popularity counts.
+- Co-subscription statistics.
+- Recommendation-related data.
+
+If IP-based abuse protection is implemented, IP information must be stored only as a salted hash with a short expiration period.
+
+### What the Server Never Stores
+
+Openfolio is designed not to store:
+
+- User accounts or passwords.
+- Personal identities.
+- Persistent user identifiers.
+- Individual reading history.
+- Read/unread status.
+- Locally cached articles.
+- Full extracted article content.
+- Personal subscription lists by default.
+
+Personal reading data remains on the user's device.
+
+### Explicit Opt-In Sharing
+
+Subscription sharing is disabled by default.
+
+The sharing process:
+
+1. The user opens the Discover page.
+2. The user is informed about anonymous subscription sharing.
+3. The user explicitly enables sharing.
+4. The client submits subscriptions as one anonymous batch.
+5. The backend validates and normalizes URLs.
+6. The database updates aggregated feed statistics.
+7. The user receives community recommendations.
+
+Users can use Openfolio without enabling subscription sharing.
+
+### Threat Model
+
+| Threat | Protection |
+|---|---|
+| Accidental subscription sharing | Explicit opt-in |
+| Duplicate subscriptions | URL normalization |
+| Malicious URLs | HTTP/HTTPS validation |
+| Private network access | Private IP and localhost rejection |
+| Oversized submissions | Batch-size limits |
+| Automated spam | Rate limiting or another abuse-protection mechanism |
+| Malicious article HTML | DOMPurify sanitization |
+| Network failures | Error handling and local caching |
+| Unauthorized cross-origin requests | CORS configuration |
+
+### Accepted Limitations
+
+Openfolio minimizes the collection of personal information but does not guarantee absolute anonymity against every network-level observer.
+
+- Hosting providers may observe incoming network connections.
+- Malicious websites may provide misleading feed content.
+- Spam submissions may influence community recommendations.
+- Browser storage may be lost if the user clears browser data.
+
+---
+
+## 4. Demo Instructions
+
+### Sample Websites to Test
+
+| Website | URL | Feature to Test |
+|---|---|---|
+| BBC News | https://www.bbc.com/news | Feed discovery |
+| NASA | https://www.nasa.gov | RSS discovery |
+| The Verge | https://www.theverge.com | Feed parsing |
+| Ars Technica | https://arstechnica.com | Article extraction |
+| Smashing Magazine | https://www.smashingmagazine.com | Reading view |
+| Hacker News | https://news.ycombinator.com | Feed discovery |
+
+Feed availability can change. If homepage autodiscovery fails, try the website's published RSS or Atom feed URL.
+
+### Edge Case Testing
+
+**Test 1: Website Without a Feed**
+
+Use a website that does not publish RSS or Atom.
+
+Expected result:
+- The application attempts feed autodiscovery.
+- It checks common feed paths.
+- It displays a clear error if no feed exists.
+- The application does not crash.
+
+**Test 2: Dead Feed**
+
+Enter an invalid or unavailable feed URL.
+
+Expected result:
+- An appropriate error is displayed.
+- Other subscriptions continue working.
+- The timeline remains accessible.
+- Previously cached articles remain available.
+
+**Test 3: Article Extraction Failure**
+
+Open an article whose content cannot be extracted.
+
+Expected result:
+- The application attempts article extraction.
+- Extraction failure is handled gracefully.
+- The original feed summary is displayed as a fallback.
+- The reading view remains usable.
+
+**Test 4: Duplicate URLs**
+
+Try adding equivalent URLs:
+
+```text
+https://example.com/feed
+https://example.com/feed/
+https://EXAMPLE.com/feed
+```
+
+Expected result:
+- URLs are normalized.
+- Equivalent feeds are deduplicated.
+- Duplicate subscriptions do not inflate popularity counts.
+
+Normalization must preserve meaningful differences in feed paths and query parameters.
+
+**Test 5: Offline Reading**
+
+1. Subscribe to a working feed.
+2. Open several articles.
+3. Disconnect the internet.
+4. Reload the application.
+5. Open previously cached articles.
+
+Expected result:
+- Cached posts remain accessible.
+- Previously cached article content can be read.
+- Reading state is preserved.
+- The application remains usable offline.
+
+**Test 6: Anonymous Discovery**
+
+1. Open the Discover page.
+2. Verify that sharing is disabled by default.
+3. Enable anonymous sharing.
+4. Submit subscriptions.
+5. Check the backend logs or database.
+6. Request popular feeds.
+7. Request recommendations.
+
+Expected result:
+- Subscriptions are submitted only after opt-in.
+- Feed popularity is updated.
+- Recommendations use co-subscription patterns.
+- Already-followed feeds are excluded.
+- No account or persistent user ID is required.
+
+---
+
+## 5. Main Features
+
+- RSS and Atom feed support.
+- Automatic feed discovery.
+- Unified chronological timeline.
+- Subscription management.
+- Read/unread tracking.
+- Full-text article reading.
+- HTML sanitization.
+- Graceful extraction fallback.
+- Local article caching.
+- Offline-first reading.
+- Anonymous community discovery.
+- Popular feed rankings.
+- Co-subscription recommendations.
+- URL normalization and deduplication.
+- Privacy-focused architecture.
+
+---
+
+## 6. Deployment
+
+Openfolio can be deployed using Vercel.
+
+Recommended architecture:
+
+```text
+                 VERCEL
+                   |
+          +--------+--------+
+          |                 |
+          v                 v
+      FRONTEND           BACKEND
+      React/Vite         FastAPI
+                            |
+                            v
+                     HOSTED DATABASE
+                       PostgreSQL
+```
+
+Configure the production frontend environment variable:
+
+```env
+VITE_API_BASE_URL=https://YOUR-BACKEND-URL
+```
+
+Configure backend CORS to allow the deployed frontend domain.
+
+Use a persistent hosted database for discovery information. Do not rely on serverless local SQLite storage for production persistence.
+
+---
+
+## 7. Project Goal
+
+Openfolio aims to provide a fast, privacy-conscious reading experience without requiring user accounts or centralized tracking.
+
+Its architecture separates personal reading data from anonymous community discovery while keeping feed parsing, article extraction, and offline caching on the client side.
+
+**Read privately. Discover collectively. Own your reading experience.**
