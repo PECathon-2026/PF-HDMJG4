@@ -121,7 +121,7 @@ The discovery service calculates feed popularity and co-subscription recommendat
 ### Clone the Repository
 
 ```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
+git clone https://github.com/PECathon-2026/PF-HDMJG4.git
 cd Openfolio
 ```
 
